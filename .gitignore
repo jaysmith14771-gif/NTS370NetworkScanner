@@ -2,3 +2,4 @@
 .guides/bashtests/bash_history.log
 .guides/bashtests/shell_output.log
 .settings
+.codio
