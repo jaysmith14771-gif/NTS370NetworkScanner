@@ -3,3 +3,4 @@
 .guides/bashtests/shell_output.log
 .settings
 .codio
+report-*.txt

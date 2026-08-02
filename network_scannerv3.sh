@@ -8,7 +8,7 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-TIMESTAMP=$(date +%m-%d-%Y-%H%M%S)
+TIMESTAMP=$(date +%m-%d-%Y-%H-%M-%S)
 OUTPUT_FILE="report-${TIMESTAMP}.txt"
 
 # ---------- Error Handling ----------
@@ -19,6 +19,19 @@ error_exit() {
 }
 
 trap 'error_exit "An unexpected error occurred while generating the report."' ERR
+
+#------------ Required Tools-----------
+
+PACKAGE="nmap"
+
+if ! dpkg -l | grep -q "^ii  $PACKAGE "; then
+    echo "$PACKAGE is not installed. Installing..."
+    sudo apt update && sudo apt install -y "$PACKAGE"
+else
+    echo "$PACKAGE is already installed."
+    echo "updating NMAP NSE DB"
+    sudo nmap --script-updatedb
+fi
 
 # ---------- Common Port Reference Tables ----------
 
@@ -288,19 +301,19 @@ main() {
         case "$scan_type" in
 
             1)
-                SCAN_COMMAND=(nmap -sV "$target")
+                SCAN_COMMAND=(nmap -sV --script vuln "$target")
                 SCAN_NAME="Service Version Detection (-sV)"
                 break
                 ;;
 
             2)
-                SCAN_COMMAND=(nmap -sS "$target")
+                SCAN_COMMAND=(nmap -sS --script vuln  "$target")
                 SCAN_NAME="TCP SYN Scan (-sS)"
                 break
                 ;;
 
             3)
-                SCAN_COMMAND=(nmap -sV -O "$target")
+                SCAN_COMMAND=(nmap -sV -O --script vuln "$target")
                 SCAN_NAME="Service + OS Detection (-sV -O)"
                 break
                 ;;
