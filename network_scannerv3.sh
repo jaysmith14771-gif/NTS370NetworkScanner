@@ -22,16 +22,47 @@ trap 'error_exit "An unexpected error occurred while generating the report."' ER
 
 #------------ Required Tools-----------
 
+sudo apt install xmlstarlet
 PACKAGE="nmap"
+DEFAULT_DIR=$(pwd)
+SCRIPTS_DIR="/usr/share/nmap/scripts"
 
-if ! dpkg -l | grep -q "^ii  $PACKAGE "; then
-    echo "$PACKAGE is not installed. Installing..."
-    sudo apt update && sudo apt install -y "$PACKAGE"
-else
-    echo "$PACKAGE is already installed."
-    echo "updating NMAP NSE DB"
-    sudo nmap --script-updatedb
+# Foolproof check: Sees if the 'nmap' command actually exists in the system path
+if ! command -v $PACKAGE &> /dev/null; then 
+    echo "$PACKAGE is not installed. Installing..." 
+    sudo apt update && sudo apt install -y "$PACKAGE" 
 fi
+
+# This runs EVERY time now, ensuring your scripts update even if Nmap was already installed
+echo "Nmap is verified. Updating Nmap 3rd party scripts and database..."
+
+# 1. Safely handle the vulscan directory
+if [ ! -d "$SCRIPTS_DIR/vulscan" ]; then
+    sudo mkdir -p "$SCRIPTS_DIR/vulscan"
+fi
+
+# 2. Navigate and clone/update the repository incrementally
+cd "$SCRIPTS_DIR/vulscan"
+if [ ! -d "scipag_vulscan/.git" ]; then
+    echo "Cloning scipag_vulscan repository..."
+    sudo git clone --depth 1 https://github.com/scipag/vulscan scipag_vulscan 
+else
+    echo "Updating existing scipag_vulscan repository..."
+    cd scipag_vulscan && sudo git pull && cd ..
+fi
+
+# 3. Create the symlink inside the main scripts folder if it doesn't exist
+if [ ! -L "$SCRIPTS_DIR/vulscan.nse" ]; then
+    sudo ln -s "$SCRIPTS_DIR/vulscan/scipag_vulscan/vulscan.nse" "$SCRIPTS_DIR/vulscan.nse"
+fi
+
+# 4. Refresh Nmap's database map
+sudo nmap --script-updatedb
+
+# 5. Return to the starting directory
+cd "$DEFAULT_DIR"
+echo "Setup complete!"
+
 
 # ---------- Common Port Reference Tables ----------
 
@@ -190,11 +221,31 @@ write_ports_section() {
 }
 
 write_vulns_section() {
-    echo "### Potential Vulnerabilities Identified"
+    local results
+
+    results=$("${SCAN_COMMAND[@]}" | grep "VULNERABLE" || true)
+    
+    {
+        echo
+        echo "### Potential Vulnerabilities Identified"
+        echo "----------------------"
+
+        if [[ -n "$results" ]]; then
+            echo "$results"
+        else
+            echo "No Vulns Detected :)."
+        fi
+    } >&2
+
+    
     echo
-    echo "CVE-2023-XXXX - Placeholder: Review detected services for outdated software"
-    echo "Default Credentials - Placeholder: Verify administrative services use strong credentials"
-    echo "Weak Configuration - Placeholder: Check exposed services for insecure settings"
+
+    if [[ -n "$results" ]]; then
+        echo "$results"
+    else
+        echo "No Potential Vulnerabilities detected."
+    fi
+
     echo
 }
 
@@ -292,7 +343,8 @@ main() {
         echo
         echo "Select scan type:"
         echo "1) Service Version Detection (-sV)"
-        echo "2) TCP SYN Scan (-sS)"
+        echo "2) Vuln script detection (--script vulscan.nse)"
+        echo "   Service Version Detection (-sV)      "
         echo "3) Service + OS Detection (-sV -O)"
         echo
 
@@ -301,14 +353,14 @@ main() {
         case "$scan_type" in
 
             1)
-                SCAN_COMMAND=(nmap -sV --script vuln "$target")
+                SCAN_COMMAND=(nmap -sV "$target")
                 SCAN_NAME="Service Version Detection (-sV)"
                 break
                 ;;
 
             2)
-                SCAN_COMMAND=(nmap -sS --script vuln  "$target")
-                SCAN_NAME="TCP SYN Scan (-sS)"
+                SCAN_COMMAND=(nmap -sV -oX tmpscan_report$(date +%m-%d-%Y-%H-%M-%S).xml --script vulscan.nse --script-args="vulscanoutput='ID: {id} - Title: {title} ({matches})\n'" "$target")
+                SCAN_NAME="Vuln script detection (--script vuln,vulners.nse,vulnscan.nse)"
                 break
                 ;;
 
