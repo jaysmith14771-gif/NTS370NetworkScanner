@@ -55,7 +55,7 @@ error_exit() {
     exit 1
 }
 
-trap 'error_exit "An unexpected error occurred while generating the report."' ERR
+trap 'cleanup_interrupted_scan; error_exit "An unexpected error occurred while generating the report."' INT ERR
 
 #------------ Required Tools-----------
 if ! command -v parallel &> /dev/null; then
@@ -82,7 +82,7 @@ echo "Nmap is verified. Updating Nmap 3rd party scripts and database..."
 #--update Nmap scripts and download 3rd party vulners 
 sudo nmap --script-updatedb
 if [[ ! -f "$VULNERS_SCRIPT_PATH" ]]; then
-    echo "[-] Nmap 'vulners' script missing.clonging git into the installation dir..."
+    echo "[-] Nmap 'vulners' script missing.cloning git into the installation dir..."
     
     # change directory to Nmap's script folder
     cd /usr/share/nmap/scripts/ || { echo "Error: Nmap script directory not found."; exit 1; }
@@ -113,37 +113,73 @@ trim() {
 }
 
 cleanup_interrupted_scan() {
-    # Save the original exit code or signal behavior
+    # Preserve the original exit code
     local exit_code=$?
+
     echo -e "\n\n[!] WARNING: Scan interrupted or failed! Initializing cleanup..."
 
-    # 1. Kill the nmap background process if it is still running
-    # (Since we are using a pipe, we target nmap specifically via jobs or state)
-    local nmap_pid
-    nmap_pid=$(pgrep -f "nmap.*$target" | head -n 1)
-    if [[ -n "$nmap_pid" ]]; then
-        echo " [+] Stopping active Nmap engine process (PID: $nmap_pid)..."
-        kill -9 "$nmap_pid" 2>/dev/null
+    # 1) If we captured the nmap PID when starting the scan, prefer that
+    if [[ -n "${NMAP_PID:-}" && -d "/proc/${NMAP_PID}" ]]; then
+        echo " [+] Stopping active Nmap engine process (PID: ${NMAP_PID})..."
+        # Try graceful termination first
+        kill -TERM "${NMAP_PID}" 2>/dev/null || true
+        # Wait up to 3 seconds for it to exit
+        for i in {1..6}; do
+            if [[ ! -d "/proc/${NMAP_PID}" ]]; then
+                break
+            fi
+            sleep 0.5
+        done
+        # If still alive, force kill
+        if [[ -d "/proc/${NMAP_PID}" ]]; then
+            echo " [+] Process didn't exit; forcing kill (SIGKILL)..."
+            kill -9 "${NMAP_PID}" 2>/dev/null || true
+        fi
+
+    else
+        # 2) Fallback: try to find nmap processes that contain the target in their args.
+        if [[ -n "${target:-}" ]]; then
+            echo " [+] Searching for nmap processes related to target '${target}'..."
+            # For each nmap pid, check its cmdline for the fixed string $target
+            while IFS= read -r pid; do
+                # Skip empty lines
+                [[ -z "$pid" ]] && continue
+                # Get full args safely
+                cmdline="$(ps -o args= -p "$pid" 2>/dev/null || true)"
+                if [[ -n "$cmdline" ]] && grep -Fq -- "$target" <<< "$cmdline"; then
+                    echo "     -> Found candidate nmap PID: $pid (cmd: $cmdline)"
+                    echo "     -> Terminating PID $pid..."
+                    kill -TERM "$pid" 2>/dev/null || true
+                    sleep 1
+                    if ps -p "$pid" >/dev/null 2>&1; then
+                        echo "     -> PID $pid still running, forcing SIGKILL..."
+                        kill -9 "$pid" 2>/dev/null || true
+                    fi
+                fi
+            done < <(pgrep -f nmap || true)
+        else
+            echo " [+] No NMAP_PID and no target available; skipping process termination."
+        fi
     fi
 
-    # 2. Ensure the destination folder exists
+    # Ensure the destination folder exists for interrupted artifacts
     mkdir -p "$INTERRUPTED_DIR"
 
-    # 3. Move the raw log file if it contains data
+    # Move raw log if it exists
     if [[ -f "${RAW_SCAN_LOG:-}" ]]; then
-        mv "$RAW_SCAN_LOG" "$INTERRUPTED_DIR/FAILED_RAW_${TIMESTAMP:-$(date +%s)}_${RAW_SCAN_LOG##*/}"
-        echo " [+] Moved partial raw log data to: $INTERRUPTED_DIR"
+        mv -f -- "$RAW_SCAN_LOG" "$INTERRUPTED_DIR/FAILED_RAW_${TIMESTAMP:-$(date +%s)}_${RAW_SCAN_LOG##*/}"
+        echo " [+] Moved partial raw log to: $INTERRUPTED_DIR"
     fi
 
-    # 4. Move partial XML data if option 3 was selected
+    # Move partial XML if present
     if [[ -n "${XML_REPORT:-}" && -f "$XML_REPORT" ]]; then
-        mv "$XML_REPORT" "$INTERRUPTED_DIR/FAILED_XML_${TIMESTAMP:-$(date +%s)}_${XML_REPORT##*/}"
-        echo " [+] Moved partial XML data to: $INTERRUPTED_DIR"
+        mv -f -- "$XML_REPORT" "$INTERRUPTED_DIR/FAILED_XML_${TIMESTAMP:-$(date +%s)}_${XML_REPORT##*/}"
+        echo " [+] Moved partial XML to: $INTERRUPTED_DIR"
     fi
 
-    # 5. Clean up temporary output layout masks to keep workspace clean
+    # Remove partial OUTPUT_FILE if it exists
     if [[ -f "${OUTPUT_FILE:-}" ]]; then
-        rm -f "$OUTPUT_FILE"
+        rm -f -- "$OUTPUT_FILE"
     fi
 
     echo "[+] Workspace reset complete. Exiting safely."
@@ -228,7 +264,7 @@ prompt_for_ports() {
 
     local ports
     while true; do
-        read -rp "Enter ports to include. Seperate individual port numbers with a comma (example: 22,80,443) And Seperate spans of ports with - (example 100-1024, 1-65535): " ports
+        read -rp "Enter ports to include. Separate individual port numbers with a comma (example: 22,80,443) And Seperate spans of ports with - (example 100-1024, 1-65535): " ports
         if ports="$(normalize_port_spec "$ports")"; then
             printf 'T:%s\n' "$ports"
             return 0
@@ -565,13 +601,15 @@ main() {
     done
 
      echo; echo "Running scan..."
-     echo "Press (or hold) "Spacebar" to see Nmap Progress"
+     echo "Press (or hold) Spacebar to see Nmap Progress"
 
     # Capture Nmap's complete console output for report parsing while also
     # displaying it live in the terminal.
-    stdbuf -oL -eL "${SCAN_COMMAND[@]}" > "$RAW_SCAN_LOG" 2>&1
-    #stdbuf -oL -eL sudo -d "${SCAN_COMMAND[@]:1}" > "$RAW_SCAN_LOG" 2>&1
+    stdbuf -oL -eL "${SCAN_COMMAND[@]}" > "$RAW_SCAN_LOG" 2>&1 &
+    NMAP_PID=$!
+    wait "${NMAP_PID}"
     scan_exit_code=$?
+    unset NMAP_PID
     if (( scan_exit_code != 0 )); then
       echo "ERROR: Nmap exited with status ${scan_exit_code}." >&2
       return "$scan_exit_code"
