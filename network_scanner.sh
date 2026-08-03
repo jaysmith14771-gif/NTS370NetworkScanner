@@ -55,7 +55,7 @@ error_exit() {
     exit 1
 }
 
-trap 'cleanup_interrupted_scan; error_exit "An unexpected error occurred while generating the report."' INT ERR
+#trap 'cleanup_interrupted_scan; error_exit "An unexpected error occurred while generating the report."' INT ERR
 
 #------------ Required Tools-----------
 if ! command -v parallel &> /dev/null; then
@@ -186,7 +186,7 @@ cleanup_interrupted_scan() {
     exit "$exit_code"
 }
 
-trap cleanup_interrupted_scan INT ERR
+trap cleanup_interrupted_scan INT TERM ERR
 
 validate_ipv4() {
     local ip="$1"
