@@ -4,3 +4,5 @@
 .settings
 .codio
 report-*.txt
+/scan_vault/
+scanner.conf
