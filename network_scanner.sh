@@ -10,7 +10,7 @@
 set -Eeuo pipefail
 
 #------------Initial Configuration-----------
-
+trap cleanup_interrupted_scan INT TERM ERR
 #-#----Directories--------
 #-API KEY CONFIGURATION
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
@@ -20,34 +20,69 @@ VULNER_API_KEY=""
 set -a
 [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
 set +a
+TIMESTAMP="$(date +%m-%d-%Y-%H-%M-%S)"
+# New Global Directory For CVE
+#TARGET_FILE="${TARGET_FILE:-config/targets.txt}"
+#SCAN_JOBS="${SCAN_JOBS:-2}"
+#NVD_JOBS="${NVD_JOBS:-4}"
+NVD_START_DELAY="${NVD_START_DELAY:-0.8}"
+MIN_CVSS="${MIN_CVSS:-0.0}"
+RUN_ID="${RUN_ID:-${TIMESTAMP}}"
+VAULT_DIR="scan_vault"
+RUN_DIR="${VAULT_DIR}/${RUN_DIR:-assessment-$RUN_ID}"
+RAW_NMAP_DIR="$RUN_DIR/raw/nmap"
+RAW_KEV_DIR="$RUN_DIR/raw/kev"
+EXTRACTED_DIR="$RUN_DIR/extracted"
+NVD_CACHE_DIR="$RUN_DIR/cache/nvd"
+NORMALIZED_CVE_DIR="$RUN_DIR/normalized/cve"
+NORMALIZED_DIR="$RUN_DIR/normalized"
+LOG_DIR="$RUN_DIR/logs"
+STATE_DIR="$RUN_DIR/state/completed"
+MANIFEST_DIR="$RUN_DIR/manifests"
+LOG_FILE="$LOG_DIR/pipeline.log"
+CLEAN_TARGET_FILE="$RUN_DIR/config/targets.clean.txt"
+KEV_FILE="$RAW_KEV_DIR/known_exploited_vulnerabilities.json"
+SCAN_TS="${RUN_ID}"
+BASE_PATH="${RAW_NMAP_DIR}/scan_${SCAN_TS}"
+REPORTS_DIR="${VAULT_DIR}/reports"
+REPORT_NAME="report-${TIMESTAMP}.txt"
+mkdir -p "$RAW_NMAP_DIR" "$RAW_KEV_DIR" \
+  "$EXTRACTED_DIR" "$NVD_CACHE_DIR" "$NORMALIZED_CVE_DIR" \
+  "$LOG_DIR" "$STATE_DIR" "$MANIFEST_DIR" "$REPORTS_DIR"
+#export TIMESTAMP
+#export REPORT_NAME
+#export OUTPUT_FILE
+#export FINAL_REPORT
+#export RAW_SCAN_LOG
+#export XML_REPORT
+#export RAW_SCAN_LOG_DIR
 # GLOBAL DIRECTORY CONFIGURATION
-export VAULT_DIR="scan_vault"
-export INPROGRESS_SCANS="${VAULT_DIR}/in_progress_scans"
-export LOGS_DIR="${VAULT_DIR}/nmaplogs"
-export REPORTS_DIR="${VAULT_DIR}/reports"
-export XML_DIR="${VAULT_DIR}/vulnxml"
-export INTERRUPTED_DIR="${VAULT_DIR}/interrupted_scans"
+#export INPROGRESS_SCANS="${VAULT_DIR}/in_progress_scans"
+#export LOGS_DIR="${VAULT_DIR}/nmaplogs"
+#export REPORTS_DIR="${VAULT_DIR}/reports"
+#export XML_DIR="${VAULT_DIR}/vulnxml"
+#export INTERRUPTED_DIR="${VAULT_DIR}/interrupted_scans"
+#export RAW_SCAN_LOG_DIR="${INPROGRESS_SCANS}/nmap"
+
+
+# 2. Define your base path (directory + filename prefix)
+
 
 # GLOBAL RUNTIME FILE DEFINITIONS
-TIMESTAMP="$(date +%m-%d-%Y-%H-%M-%S)"
-REPORT_NAME="report-${TIMESTAMP}.txt"
 
-OUTPUT_FILE="${INPROGRESS_SCANS}/${REPORT_NAME}"
-FINAL_REPORT="${REPORTS_DIR}/${REPORT_NAME}"
-RAW_SCAN_LOG="${INPROGRESS_SCANS}/raw_scan_${TIMESTAMP}.log"
-XML_REPORT="${INPROGRESS_SCANS}/tmpscan_report_${TIMESTAMP}.xml"
 
-export TIMESTAMP
-export REPORT_NAME
-export OUTPUT_FILE
-export FINAL_REPORT
-export RAW_SCAN_LOG
-export XML_REPORT
+
+#OUTPUT_FILE="${INPROGRESS_SCANS}/${REPORT_NAME}"
+#FINAL_REPORT="${REPORTS_DIR}/${REPORT_NAME}"
+#RAW_SCAN_LOG="${INPROGRESS_SCANS}/nmap_scan_${TIMESTAMP}"
+#XML_REPORT="${INPROGRESS_SCANS}/tmpscan_report_${TIMESTAMP}.xml"
+
+
 #-create missing directories
-init_persistence_vault(){
-mkdir -p "$LOGS_DIR" "$REPORTS_DIR" "$XML_DIR" "$INTERRUPTED_DIR" "$INPROGRESS_SCANS"
-}
-init_persistence_vault
+#init_persistence_vault(){
+#mkdir -p "$LOGS_DIR" "$REPORTS_DIR" "$XML_DIR" "$INTERRUPTED_DIR" "$INPROGRESS_SCANS" "$RAW_SCAN_LOG_DIR" 
+#}
+#init_persistence_vault
 # ---------- Error Handling ----------
 
 error_exit() {
@@ -62,9 +97,31 @@ if ! command -v parallel &> /dev/null; then
     echo "GNU Parallel is not installed. Installing..."
     sudo apt update && sudo apt install -y parallel
 fi
-
 if ! command -v xmlstarlet &> /dev/null; then
+    echo "XmlStarlet is not installed. Installing..."
     sudo apt update && sudo apt install -y xmlstarlet
+fi
+if ! command -v curl &> /dev/null; then
+    echo "Curl is not installed. Installing..."
+    sudo apt update && sudo apt install -y curl
+fi
+if ! command -v sha256sum &> /dev/null; then
+    echo "Sha256sum is not installed. Installing..."
+    sudo apt update && sudo apt install -y sha256sum
+fi
+if ! command -v sort &> /dev/null; then
+    echo "sort is not installed. Installing..."
+    sudo apt update && sudo apt install -y sort
+fi
+if ! command -v awk &> /dev/null; then
+    echo "awk is not installed. Installing..."
+    sudo apt update && sudo apt install -y awk
+fi
+if ! command -v tr &> /dev/null; then
+    sudo apt update && sudo apt install -y tr
+fi
+if ! command -v jq &> /dev/null; then
+    sudo apt update && sudo apt install -y jq
 fi
 
 PACKAGE="nmap"
@@ -99,6 +156,14 @@ fi
 cd "$DEFAULT_DIR"
 
 echo "Setup complete!"
+
+#-Download local KEV Catalog
+KEV_URL='https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json'
+KEV_FILE="$RAW_KEV_DIR/known_exploited_vulnerabilities.json"
+
+
+curl -o "${KEV_FILE}" "${KEV_URL}"
+
 
 #-removed port description block now that nmap is integrated
 #-legacy component to simulate nmap results removed
@@ -162,31 +227,16 @@ cleanup_interrupted_scan() {
         fi
     fi
 
-    # Ensure the destination folder exists for interrupted artifacts
-    mkdir -p "$INTERRUPTED_DIR"
-
-    # Move raw log if it exists
-    if [[ -f "${RAW_SCAN_LOG:-}" ]]; then
-        mv -f -- "$RAW_SCAN_LOG" "$INTERRUPTED_DIR/FAILED_RAW_${TIMESTAMP:-$(date +%s)}_${RAW_SCAN_LOG##*/}"
-        echo " [+] Moved partial raw log to: $INTERRUPTED_DIR"
-    fi
-
-    # Move partial XML if present
-    if [[ -n "${XML_REPORT:-}" && -f "$XML_REPORT" ]]; then
-        mv -f -- "$XML_REPORT" "$INTERRUPTED_DIR/FAILED_XML_${TIMESTAMP:-$(date +%s)}_${XML_REPORT##*/}"
-        echo " [+] Moved partial XML to: $INTERRUPTED_DIR"
-    fi
-
     # Remove partial OUTPUT_FILE if it exists
-    if [[ -f "${OUTPUT_FILE:-}" ]]; then
-        rm -f -- "$OUTPUT_FILE"
+    if [[ -r "${RUN_DIR:-}" ]]; then
+        rm -r -- "${RUN_DIR:-}"
     fi
 
     echo "[+] Workspace reset complete. Exiting safely."
     exit "$exit_code"
 }
 
-trap cleanup_interrupted_scan INT TERM ERR
+
 
 validate_ipv4() {
     local ip="$1"
@@ -309,9 +359,69 @@ expand_port_spec() {
     done | sort -n -u
 }
 
-#-removed legacy port lookup that was emulating nmap scans
+#--------------------------------------------
+# ---------Report Parsing Functions ---------
+#--------------------------------------------
 
-# ---------- Report Functions ----------
+##-extracting unique cve's from report logs--
+extract_unique_cve(){
+    find "$RAW_NMAP_DIR" -type f -name '*.xml' -print0 |
+    while IFS= read -r -d '' xml; do
+      xmlstarlet sel -t \
+        -m '/nmaprun/host/ports/port/script[@id="vulners"]' \
+        -m './/table[starts-with(elem[@key="id"], "CVE-")]' \
+        -v 'elem[@key="id"]' -n \
+        "$xml"
+    done |
+    grep -E '^CVE-[0-9]{4}-[0-9]{4,}$' |
+    LC_ALL=C sort -u > "$EXTRACTED_DIR/cves.txt"
+}
+
+##--Caching NIST NVD CVE details------------
+
+cache_cve_details(){
+    
+    local cve_id="$1"
+    local output="$NVD_CACHE_DIR/$cve_id.json"
+    local tmp="${output}.tmp.$$"
+
+    [[ "$cve_id" =~ ^CVE-[0-9]{4}-[0-9]{4,}$ ]] || return 64
+
+    if [[ -s "$output" ]] &&
+       jq -e --arg id "$cve_id" \
+         '.vulnerabilities[0].cve.id == $id' "$output" >/dev/null 2>&1; then
+      log INFO "NVD CACHE $cve_id"
+      return 0
+    fi
+
+    curl  --retry 5 \
+      --connect-timeout 10 --max-time 90 \
+      -H "apiKey: $NVD_API_KEY" \
+      --get --data-urlencode "cveId=$cve_id" \
+      'https://services.nvd.nist.gov/rest/json/cves/2.0' \
+      > "$tmp"
+
+    jq -e --arg id "$cve_id" '
+      .totalResults == 1 and
+      .vulnerabilities[0].cve.id == $id
+    ' "$tmp" >/dev/null
+      log INFO "NVD PASS $cve_id"
+
+    jq --arg id "$cve_id" '
+    first(
+      .vulnerabilities[]
+      | select(.cveID == $id)
+    ) // null
+  ' "$KEV_FILE"
+
+}
+
+
+
+  
+
+
+# ---------- OLD Report Functions ----------
 
 write_header() {
     local target="$1"
@@ -581,7 +691,7 @@ main() {
         read -rp "Choice [1-3]: " scan_type
         case "$scan_type" in
             1)
-                SCAN_COMMAND=(nmap -sV  "${PORT_ARGS[@]}"  --open -oA "$RAW_SCAN_LOG" "$target")
+                SCAN_COMMAND=(nmap -sV  "${PORT_ARGS[@]}"  --open -oA "${BASE_PATH}" "$target")
                 SCAN_NAME="Service Version Detection (-sV)"
                 break
                 ;;
@@ -591,7 +701,7 @@ main() {
                 break
                 ;;
             3)
-                SCAN_COMMAND=(sudo nmap -sV -T3 -n --script="(vuln and not (dos or brute or broadcast)),vulners" "${PORT_ARGS[@]}" --script-timeout 3m -oN "$RAW_SCAN_LOG" -oX "$XML_REPORT" "$target")
+                SCAN_COMMAND=(sudo nmap -sS -sV -O -T3 -n --script=vulners "${PORT_ARGS[@]}" --script-timeout 3m -oA "${BASE_PATH}" "$target")
                 SCAN_NAME="Parallel Vuln script detection (--script nmap vuln,vulners)"
                 break
                 ;;
@@ -606,7 +716,7 @@ main() {
 
     # Capture Nmap's complete console output for report parsing while also
     # displaying it live in the terminal.
-    stdbuf -oL -eL "${SCAN_COMMAND[@]}" > "$RAW_SCAN_LOG" 2>&1 &
+    stdbuf -oL -eL "${SCAN_COMMAND[@]}" 2>&1 | tee "$RAW_SCAN_LOG"
     NMAP_PID=$!
     wait "${NMAP_PID}"
     scan_exit_code=$?
@@ -616,9 +726,11 @@ main() {
       return "$scan_exit_code"
     fi
 
-    #printf "\nScan Progress: [%-20s] 100%%\n\n" "####################"
+   
     # Generate final parsed markdown report
     {
+    extract_unique_cve
+    cache_cve_details
     write_header "$target" "$SCAN_NAME"
     write_ports_section
     write_vulns_section
