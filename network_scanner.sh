@@ -4,10 +4,10 @@
 # Secure Network Report Generator v4
 # ==========================================
 
-set -o errexit
-set -o nounset
-set -o pipefail
-
+#set -o errexit
+#set -o nounset
+#set -o pipefail
+set -Eeuo pipefail
 
 #------------Initial Configuration-----------
 
@@ -264,7 +264,8 @@ prompt_for_ports() {
 
     local ports
     while true; do
-        read -rp "Enter ports to include. Separate individual port numbers with a comma (example: 22,80,443) And Seperate spans of ports with - (example 100-1024, 1-65535): " ports
+        echo ""
+        read -rp $'Enter ports to include.\n- Separate individual ports with a comma (e.g., 22,80,443)\n- Separate ranges with a hyphen (e.g., 100-1024,1025-65535)\n> ' ports
         if ports="$(normalize_port_spec "$ports")"; then
             printf 'T:%s\n' "$ports"
             return 0
@@ -580,7 +581,7 @@ main() {
         read -rp "Choice [1-3]: " scan_type
         case "$scan_type" in
             1)
-                SCAN_COMMAND=(nmap -sV  "${PORT_ARGS[@]}"  --open -oN "$RAW_SCAN_LOG" "$target")
+                SCAN_COMMAND=(nmap -sV  "${PORT_ARGS[@]}"  --open -oA "$RAW_SCAN_LOG" "$target")
                 SCAN_NAME="Service Version Detection (-sV)"
                 break
                 ;;

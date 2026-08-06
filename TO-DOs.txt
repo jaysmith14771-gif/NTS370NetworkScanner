@@ -1,0 +1,1 @@
+added -oA nmap log appendix, update script cleanup and integrate .xml integration
