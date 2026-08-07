@@ -4,5 +4,7 @@
 .settings
 .codio
 report-*.txt
-/scan_vault/
+/assessments/
+/cache/
+/reports/
 scanner.conf

@@ -4,93 +4,272 @@
 # Secure Network Report Generator v4
 # ==========================================
 
-#set -o errexit
-#set -o nounset
-#set -o pipefail
 set -Eeuo pipefail
 
+#------------cleanup logic-----------
+remove_partial_scan_artifacts() {
+local artifact
+ 
+# Do not continue unless the required paths are initialized.
+if [[ -z "${RUN_DIR:-}" ||
+-z "${RAW_NMAP_DIR:-}" ||
+-z "${BASE_PATH:-}" ]]; then
+printf '[!] Runtime paths are incomplete; skipping artifact cleanup.\n' \
+>&2
+return 0
+fi
+ 
+# Safety boundary: only operate inside this assessment's Nmap directory.
+case "$BASE_PATH" in
+"${RAW_NMAP_DIR}/"*)
+;;
+*)
+printf '[!] Refusing cleanup outside RAW_NMAP_DIR: %s\n' \
+"$BASE_PATH" >&2
+return 0
+;;
+esac
+ 
+local -a partial_artifacts=(
+"${BASE_PATH}.nmap"
+"${BASE_PATH}.xml"
+"${BASE_PATH}.gnmap"
+)
+ 
+for artifact in "${partial_artifacts[@]}"; do
+if [[ -e "$artifact" || -L "$artifact" ]]; then
+chmod u+w -- "$artifact" 2>/dev/null || true
+rm -f -- "$artifact" 2>/dev/null || {
+printf '[!] Could not remove partial artifact: %s\n' \
+"$artifact" >&2
+}
+fi
+done
+}
+
 #------------Initial Configuration-----------
-trap cleanup_interrupted_scan INT TERM ERR
-#-#----Directories--------
-#-API KEY CONFIGURATION
-SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+# ==================================================
+# Global Time Variables
+# ==================================================
+
+readonly START_EPOCH="$(date +%s)"
+readonly TIMESTAMP="$(date +'%Y-%m-%d_%H-%M-%S')"
+readonly RUN_ID="${TIMESTAMP}"
+
+# ==================================================
+# Paths
+# ==================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 CONFIG_FILE="${SCRIPT_DIR}/scanner.conf"
-NVD_API_KEY=""
-VULNER_API_KEY=""
-set -a
-[ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
-set +a
-TIMESTAMP="$(date +%m-%d-%Y-%H-%M-%S)"
-# New Global Directory For CVE
-#TARGET_FILE="${TARGET_FILE:-config/targets.txt}"
-#SCAN_JOBS="${SCAN_JOBS:-2}"
-#NVD_JOBS="${NVD_JOBS:-4}"
-NVD_START_DELAY="${NVD_START_DELAY:-0.8}"
-MIN_CVSS="${MIN_CVSS:-0.0}"
-RUN_ID="${RUN_ID:-${TIMESTAMP}}"
-VAULT_DIR="scan_vault"
-RUN_DIR="${VAULT_DIR}/${RUN_DIR:-assessment-$RUN_ID}"
-RAW_NMAP_DIR="$RUN_DIR/raw/nmap"
-RAW_KEV_DIR="$RUN_DIR/raw/kev"
-EXTRACTED_DIR="$RUN_DIR/extracted"
-NVD_CACHE_DIR="$RUN_DIR/cache/nvd"
-NORMALIZED_CVE_DIR="$RUN_DIR/normalized/cve"
-NORMALIZED_DIR="$RUN_DIR/normalized"
-LOG_DIR="$RUN_DIR/logs"
-STATE_DIR="$RUN_DIR/state/completed"
-MANIFEST_DIR="$RUN_DIR/manifests"
-LOG_FILE="$LOG_DIR/pipeline.log"
-CLEAN_TARGET_FILE="$RUN_DIR/config/targets.clean.txt"
-KEV_FILE="$RAW_KEV_DIR/known_exploited_vulnerabilities.json"
-SCAN_TS="${RUN_ID}"
-BASE_PATH="${RAW_NMAP_DIR}/scan_${SCAN_TS}"
-REPORTS_DIR="${VAULT_DIR}/reports"
-REPORT_NAME="report-${TIMESTAMP}.txt"
-mkdir -p "$RAW_NMAP_DIR" "$RAW_KEV_DIR" \
-  "$EXTRACTED_DIR" "$NVD_CACHE_DIR" "$NORMALIZED_CVE_DIR" \
-  "$LOG_DIR" "$STATE_DIR" "$MANIFEST_DIR" "$REPORTS_DIR"
-#export TIMESTAMP
-#export REPORT_NAME
-#export OUTPUT_FILE
-#export FINAL_REPORT
-#export RAW_SCAN_LOG
-#export XML_REPORT
-#export RAW_SCAN_LOG_DIR
-# GLOBAL DIRECTORY CONFIGURATION
-#export INPROGRESS_SCANS="${VAULT_DIR}/in_progress_scans"
-#export LOGS_DIR="${VAULT_DIR}/nmaplogs"
-#export REPORTS_DIR="${VAULT_DIR}/reports"
-#export XML_DIR="${VAULT_DIR}/vulnxml"
-#export INTERRUPTED_DIR="${VAULT_DIR}/interrupted_scans"
-#export RAW_SCAN_LOG_DIR="${INPROGRESS_SCANS}/nmap"
+
+# ==================================================
+# Load Configuration
+# ==================================================
+
+NVD_API_KEY="${NVD_API_KEY:-}"
+VULNERS_API_KEY="${VULNERS_API_KEY:-}"
+
+if [[ -f "$CONFIG_FILE" ]]; then
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+fi
+
+# ==================================================
+# API Configuration
+# ==================================================
+
+readonly NVD_API_URL="https://services.nvd.nist.gov/rest/json/cves/2.0"
+
+readonly KEV_URL="https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+
+# ==================================================
+# Permanent Storage
+# ==================================================
+
+CACHE_ROOT="${SCRIPT_DIR}/cache"
+
+KEV_CACHE_DIR="${CACHE_ROOT}/kev"
+
+NVD_CACHE_DIR="${CACHE_ROOT}/nvd"
+
+REPORT_ROOT="${SCRIPT_DIR}/reports"
+
+# ==================================================
+# Temporary Assessment Workspace
+# ==================================================
+
+ASSESSMENT_ROOT="${SCRIPT_DIR}/assessments"
+
+RUN_DIR="${ASSESSMENT_ROOT}/assessment-${RUN_ID}"
+
+RAW_DIR="${RUN_DIR}/raw"
+
+RAW_NMAP_DIR="${RAW_DIR}/nmap"
+
+EXTRACTED_DIR="${RUN_DIR}/extracted"
+
+NORMALIZED_DIR="${RUN_DIR}/normalized"
+
+STATE_DIR="${RUN_DIR}/state"
+
+LOG_DIR="${RUN_DIR}/logs"
+
+MANIFEST_DIR="${RUN_DIR}/manifests"
+
+# ==================================================
+# Report Output
+# ==================================================
+
+REPORT_DIR="${REPORT_ROOT}/${RUN_ID}"
+
+REPORT_JSON="${REPORT_DIR}/report.json"
+
+REPORT_HTML="${REPORT_DIR}/report.html"
+
+REPORT_TXT="${REPORT_DIR}/report.txt"
+
+REPORT_LOG="${REPORT_DIR}/report.log"
+
+SCAN_BASENAME="network-scan-${RUN_ID}"
+BASE_PATH="${RAW_NMAP_DIR}/${SCAN_BASENAME}"
+
+RAW_SCAN_LOG="${BASE_PATH}.nmap"
+SCAN_XML="${BASE_PATH}.xml"
+SCAN_GNMAP="${BASE_PATH}.gnmap"
+
+# Compatibility aliases while old report functions remain.
+XML_REPORT="$SCAN_XML"
+OUTPUT_FILE="$REPORT_TXT"
+REPORT="$REPORT_TXT"
+FINAL_REPORT="$REPORT_TXT"
+
+# ==================================================
+# Permanent Cache Files
+# ==================================================
+
+KEV_FILE="${KEV_CACHE_DIR}/known_exploited_vulnerabilities.json"
+
+# ==================================================
+# Runtime Log
+# ==================================================
+
+LOG_FILE="${LOG_DIR}/pipeline.log"
+NMAP_CONSOLE_LOG="${LOG_DIR}/nmap-console.log"
+
+# ==================================================
+# Statistics
+# ==================================================
+
+TOTAL_HOSTS=0
+TOTAL_PORTS=0
+TOTAL_CVES=0
+TOTAL_KEV=0
+
+TOTAL_CRITICAL=0
+TOTAL_HIGH=0
+TOTAL_MEDIUM=0
+TOTAL_LOW=0
+
+# ==================================================
+# Runtime Databases
+# ==================================================
+
+declare -A KEV_SET
+declare -A KEV_RECORDS
+
+declare -A DISCOVERED_CVES
+declare -A CVE_COUNTS
+
+declare -A CVE_HOSTS
+declare -A CVE_PORTS
+
+declare -A KEV_MATCHES
+
+declare -A NVD_CACHE
+
+declare -A FINDINGS
 
 
-# 2. Define your base path (directory + filename prefix)
 
+# ==================================================
+# Refresh KEV Cache
+# ==================================================
 
-# GLOBAL RUNTIME FILE DEFINITIONS
+refresh_kev_catalog() {
+    local temporary_file
+    local refresh_required=0
 
+    temporary_file="${KEV_FILE}.tmp.$$"
 
+    if [[ ! -s "$KEV_FILE" ]]; then
+        refresh_required=1
+        echo "[+] KEV catalog is missing. Downloading..."
+    elif find "$KEV_FILE" -mtime +1 -print -quit | grep -q .; then
+        refresh_required=1
+        echo "[+] KEV catalog is older than one day. Refreshing..."
+    fi
 
-#OUTPUT_FILE="${INPROGRESS_SCANS}/${REPORT_NAME}"
-#FINAL_REPORT="${REPORTS_DIR}/${REPORT_NAME}"
-#RAW_SCAN_LOG="${INPROGRESS_SCANS}/nmap_scan_${TIMESTAMP}"
-#XML_REPORT="${INPROGRESS_SCANS}/tmpscan_report_${TIMESTAMP}.xml"
+    (( refresh_required == 1 )) || {
+        echo "[+] Using cached KEV catalog: $KEV_FILE"
+        return 0
+    }
 
+    if ! curl \
+        --fail \
+        --silent \
+        --show-error \
+        --location \
+        --connect-timeout 10 \
+        --max-time 60 \
+        --retry 3 \
+        --retry-delay 2 \
+        "$KEV_URL" \
+        --output "$temporary_file"; then
 
-#-create missing directories
-#init_persistence_vault(){
-#mkdir -p "$LOGS_DIR" "$REPORTS_DIR" "$XML_DIR" "$INTERRUPTED_DIR" "$INPROGRESS_SCANS" "$RAW_SCAN_LOG_DIR" 
-#}
-#init_persistence_vault
+        rm -f -- "$temporary_file"
+
+        if [[ -s "$KEV_FILE" ]]; then
+            echo "[!] KEV refresh failed; retaining existing cache." >&2
+            return 0
+        fi
+
+        error_exit "Unable to download the KEV catalog."
+    fi
+
+    if ! jq -e '
+        .vulnerabilities
+        | type == "array" and length > 0
+    ' "$temporary_file" >/dev/null 2>&1; then
+        rm -f -- "$temporary_file"
+        error_exit "Downloaded KEV catalog failed JSON/schema validation."
+    fi
+
+    mv -- "$temporary_file" "$KEV_FILE"
+
+    echo "[+] KEV catalog updated successfully."
+}
+
+# ==================================================
+# NVD Cache Helper
+# ==================================================
+
+get_nvd_cache_file() {
+
+    local cve="$1"
+
+    printf '%s/%s.json\n' \
+        "$NVD_CACHE_DIR" \
+        "$cve"
+
+}
 # ---------- Error Handling ----------
 
 error_exit() {
     echo "Error: $1" >&2
     exit 1
 }
-
-#trap 'cleanup_interrupted_scan; error_exit "An unexpected error occurred while generating the report."' INT ERR
 
 #------------ Required Tools-----------
 if ! command -v parallel &> /dev/null; then
@@ -157,13 +336,6 @@ cd "$DEFAULT_DIR"
 
 echo "Setup complete!"
 
-#-Download local KEV Catalog
-KEV_URL='https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json'
-KEV_FILE="$RAW_KEV_DIR/known_exploited_vulnerabilities.json"
-
-
-curl -o "${KEV_FILE}" "${KEV_URL}"
-
 
 #-removed port description block now that nmap is integrated
 #-legacy component to simulate nmap results removed
@@ -177,62 +349,85 @@ trim() {
     printf '%s' "$s"
 }
 
+
+remove_partial_scan_artifacts() {
+local artifact
+ 
+# Do not continue unless the required paths are initialized.
+if [[ -z "${RUN_DIR:-}" ||
+-z "${RAW_NMAP_DIR:-}" ||
+-z "${BASE_PATH:-}" ]]; then
+printf '[!] Runtime paths are incomplete; skipping artifact cleanup.\n' \
+>&2
+return 0
+fi
+ 
+# Safety boundary: only operate inside this assessment's Nmap directory.
+case "$BASE_PATH" in
+"${RAW_NMAP_DIR}/"*)
+;;
+*)
+printf '[!] Refusing cleanup outside RAW_NMAP_DIR: %s\n' \
+"$BASE_PATH" >&2
+return 0
+;;
+esac
+ 
+local -a partial_artifacts=(
+"${BASE_PATH}.nmap"
+"${BASE_PATH}.xml"
+"${BASE_PATH}.gnmap"
+)
+ 
+for artifact in "${partial_artifacts[@]}"; do
+if [[ -e "$artifact" || -L "$artifact" ]]; then
+chmod u+w -- "$artifact" 2>/dev/null || true
+rm -f -- "$artifact" 2>/dev/null || {
+printf '[!] Could not remove partial artifact: %s\n' \
+"$artifact" >&2
+}
+fi
+done
+}
+
 cleanup_interrupted_scan() {
-    # Preserve the original exit code
     local exit_code=$?
 
-    echo -e "\n\n[!] WARNING: Scan interrupted or failed! Initializing cleanup..."
+    # Prevent recursive ERR trap execution while cleanup runs.
+    trap - ERR INT TERM
+    set +e
 
-    # 1) If we captured the nmap PID when starting the scan, prefer that
-    if [[ -n "${NMAP_PID:-}" && -d "/proc/${NMAP_PID}" ]]; then
-        echo " [+] Stopping active Nmap engine process (PID: ${NMAP_PID})..."
-        # Try graceful termination first
-        kill -TERM "${NMAP_PID}" 2>/dev/null || true
-        # Wait up to 3 seconds for it to exit
-        for i in {1..6}; do
-            if [[ ! -d "/proc/${NMAP_PID}" ]]; then
-                break
-            fi
+    printf '\n[!] Scan interrupted or failed. Initializing cleanup...\n' >&2
+
+    # Stop the exact Nmap process started by this script.
+    if [[ -n "${NMAP_PID:-}" ]] && kill -0 "$NMAP_PID" 2>/dev/null; then
+        printf '[+] Stopping Nmap process PID %s...\n' "$NMAP_PID" >&2
+
+        kill -TERM "$NMAP_PID" 2>/dev/null || true
+
+        local attempt
+        for ((attempt = 0; attempt < 10; attempt++)); do
+            kill -0 "$NMAP_PID" 2>/dev/null || break
             sleep 0.5
         done
-        # If still alive, force kill
-        if [[ -d "/proc/${NMAP_PID}" ]]; then
-            echo " [+] Process didn't exit; forcing kill (SIGKILL)..."
-            kill -9 "${NMAP_PID}" 2>/dev/null || true
-        fi
 
-    else
-        # 2) Fallback: try to find nmap processes that contain the target in their args.
-        if [[ -n "${target:-}" ]]; then
-            echo " [+] Searching for nmap processes related to target '${target}'..."
-            # For each nmap pid, check its cmdline for the fixed string $target
-            while IFS= read -r pid; do
-                # Skip empty lines
-                [[ -z "$pid" ]] && continue
-                # Get full args safely
-                cmdline="$(ps -o args= -p "$pid" 2>/dev/null || true)"
-                if [[ -n "$cmdline" ]] && grep -Fq -- "$target" <<< "$cmdline"; then
-                    echo "     -> Found candidate nmap PID: $pid (cmd: $cmdline)"
-                    echo "     -> Terminating PID $pid..."
-                    kill -TERM "$pid" 2>/dev/null || true
-                    sleep 1
-                    if ps -p "$pid" >/dev/null 2>&1; then
-                        echo "     -> PID $pid still running, forcing SIGKILL..."
-                        kill -9 "$pid" 2>/dev/null || true
-                    fi
-                fi
-            done < <(pgrep -f nmap || true)
-        else
-            echo " [+] No NMAP_PID and no target available; skipping process termination."
+        if kill -0 "$NMAP_PID" 2>/dev/null; then
+            printf '[!] Nmap did not stop gracefully; terminating PID %s.\n' \
+                "$NMAP_PID" >&2
+
+            kill -KILL "$NMAP_PID" 2>/dev/null || true
         fi
     fi
 
-    # Remove partial OUTPUT_FILE if it exists
-    if [[ -r "${RUN_DIR:-}" ]]; then
-        rm -r -- "${RUN_DIR:-}"
-    fi
+    unset NMAP_PID 2>/dev/null || true
 
-    echo "[+] Workspace reset complete. Exiting safely."
+    # Remove only incomplete Nmap artifacts for this run.
+    remove_partial_scan_artifacts
+
+    # Preserve logs, manifest, and assessment directory for diagnostics.
+    printf '[+] Failure diagnostics retained in: %s\n' \
+        "${RUN_DIR:-unavailable}" >&2
+
     exit "$exit_code"
 }
 
@@ -359,67 +554,415 @@ expand_port_spec() {
     done | sort -n -u
 }
 
+# ==================================================
+# Initialize Directory Structure
+# ==================================================
+
+initialize_runtime() {
+    REPORT_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+    TOTAL_HOSTS=0
+    TOTAL_PORTS=0
+    TOTAL_CVES=0
+    TOTAL_KEV=0
+
+    TOTAL_CRITICAL=0
+    TOTAL_HIGH=0
+    TOTAL_MEDIUM=0
+    TOTAL_LOW=0
+
+    mkdir -p \
+        "$CACHE_ROOT" \
+        "$KEV_CACHE_DIR" \
+        "$NVD_CACHE_DIR" \
+        "$ASSESSMENT_ROOT" \
+        "$RUN_DIR" \
+        "$RAW_DIR" \
+        "$RAW_NMAP_DIR" \
+        "$EXTRACTED_DIR" \
+        "$NORMALIZED_DIR" \
+        "$STATE_DIR" \
+        "$LOG_DIR" \
+        "$MANIFEST_DIR" \
+        "$REPORT_ROOT" \
+        "$REPORT_DIR"
+      : > "$LOG_FILE"
+      : > "$NMAP_CONSOLE_LOG"
+}
+
+validate_runtime_paths() {
+    local required_directories=(
+        "$KEV_CACHE_DIR"
+        "$NVD_CACHE_DIR"
+        "$RUN_DIR"
+        "$RAW_NMAP_DIR"
+        "$LOG_DIR"
+        "$MANIFEST_DIR"
+        "$REPORT_DIR"
+    )
+
+    local directory
+
+    for directory in "${required_directories[@]}"; do
+        [[ -d "$directory" ]] ||
+            error_exit "Runtime directory was not created: $directory"
+    done
+
+    [[ -n "$SCAN_XML" ]] ||
+        error_exit "SCAN_XML path was not initialized."
+
+    [[ "$SCAN_XML" == "${RAW_NMAP_DIR}/"* ]] ||
+        error_exit "SCAN_XML is outside the assessment Nmap directory."
+}
 #--------------------------------------------
 # ---------Report Parsing Functions ---------
 #--------------------------------------------
+#---------load nmap xml into memory----------
 
-##-extracting unique cve's from report logs--
-extract_unique_cve(){
-    find "$RAW_NMAP_DIR" -type f -name '*.xml' -print0 |
-    while IFS= read -r -d '' xml; do
-      xmlstarlet sel -t \
-        -m '/nmaprun/host/ports/port/script[@id="vulners"]' \
-        -m './/table[starts-with(elem[@key="id"], "CVE-")]' \
-        -v 'elem[@key="id"]' -n \
-        "$xml"
-    done |
-    grep -E '^CVE-[0-9]{4}-[0-9]{4,}$' |
-    LC_ALL=C sort -u > "$EXTRACTED_DIR/cves.txt"
+
+#---Validate Scan inputs----------
+validate_pre_scan_inputs() {
+    [[ -r "$KEV_FILE" ]] ||
+        error_exit "KEV catalog is missing or unreadable: $KEV_FILE"
+
+    [[ -n "${NVD_API_KEY:-}" ]] ||
+        error_exit "NVD_API_KEY is not configured."
 }
 
-##--Caching NIST NVD CVE details------------
+validate_post_scan_outputs() {
+    [[ -s "$SCAN_XML" ]] ||
+        error_exit "Nmap XML output is missing or empty: $SCAN_XML"
 
-cache_cve_details(){
-    
-    local cve_id="$1"
-    local output="$NVD_CACHE_DIR/$cve_id.json"
-    local tmp="${output}.tmp.$$"
+    xmlstarlet val -q "$SCAN_XML" ||
+        error_exit "Nmap XML output is not valid XML: $SCAN_XML"
+}
+#---Create post-run archive----
+create_assessment_manifest() {
 
-    [[ "$cve_id" =~ ^CVE-[0-9]{4}-[0-9]{4,}$ ]] || return 64
+cat > "${MANIFEST_DIR}/assessment.json" <<EOF
+{
+  "run_id":"${RUN_ID}",
+  "timestamp":"${TIMESTAMP}",
+  "host":"$(hostname)"
+}
+EOF
 
-    if [[ -s "$output" ]] &&
-       jq -e --arg id "$cve_id" \
-         '.vulnerabilities[0].cve.id == $id' "$output" >/dev/null 2>&1; then
-      log INFO "NVD CACHE $cve_id"
-      return 0
+}
+#--------Validate Datasources---------
+validate_inputs() {
+
+    [[ -f "$SCAN_XML" ]] || {
+        echo "Missing XML file"
+        exit 1
+    }
+
+    [[ -f "$KEV_FILE" ]] || {
+        echo "Missing KEV catalog"
+        exit 1
+    }
+
+    command -v jq >/dev/null || exit 1
+
+    command -v xmllint >/dev/null || exit 1
+}
+
+#-------Load KEV into memory--------
+load_kev_catalog() {
+    local cve
+    local vendor
+    local product
+    local date_added
+
+    [[ -r "$KEV_FILE" ]] ||
+        error_exit "KEV catalog is missing or unreadable: $KEV_FILE"
+
+    jq -e '
+        .vulnerabilities
+        | type == "array"
+    ' "$KEV_FILE" >/dev/null 2>&1 ||
+        error_exit "KEV catalog is invalid: $KEV_FILE"
+
+    while IFS=$'\t' read -r cve vendor product date_added; do
+        [[ "$cve" =~ ^CVE-[0-9]{4}-[0-9]{4,}$ ]] || continue
+
+        KEV_SET["$cve"]=1
+        KEV_RECORDS["$cve"]="${vendor}|${product}|${date_added}"
+    done < <(
+        jq -r '
+            .vulnerabilities[]
+            | [
+                .cveID // "",
+                .vendorProject // "",
+                .product // "",
+                .dateAdded // ""
+            ]
+            | @tsv
+        ' "$KEV_FILE"
+    )
+
+    (( ${#KEV_SET[@]} > 0 )) ||
+        error_exit "No valid CVEs were loaded from $KEV_FILE"
+
+    printf '[+] Loaded %d KEV records into memory.\n' \
+        "${#KEV_SET[@]}"
+}
+
+#---Extract KEV mathces from Nmap XML----
+parse_nmap_xml() {
+
+    while IFS='|' read -r host port service cve
+    do
+
+        register_cve \
+            "$host" \
+            "$port" \
+            "$service" \
+            "$cve"
+
+    done < <(
+
+        extract_vulners_records
+
+    )
+
+}
+
+#---Build in memory catalog of mathcing NMAP-KEV matches---
+extract_vulners_records() {
+
+    xmlstarlet sel \
+        -t \
+        -m "//host" \
+        -v "address/@addr" \
+        -n \
+        "$SCAN_XML"
+
+}
+
+#---Build CVE List for report generation in memory----
+register_cve() {
+    local host="$1"
+    local port="$2"
+    local service="$3"
+    local cve="${4^^}"
+
+    [[ "$cve" =~ ^CVE-[0-9]{4}-[0-9]{4,}$ ]] || return 0
+
+    DISCOVERED_CVES["$cve"]=1
+    ((CVE_COUNTS["$cve"] += 1))
+
+    CVE_HOSTS["$cve"]+="${host};"
+    CVE_PORTS["$cve"]+="${port}:${service};"
+}
+
+#---De-deplicate CVE findings-----
+deduplicate_cves() {
+
+    UNIQUE_CVES=(
+        "${!DISCOVERED_CVES[@]}"
+    )
+
+}
+
+#-----Validate Kev Matcches-----
+validate_kev_matches() {
+
+    for cve in "${UNIQUE_CVES[@]}"
+    do
+
+        if [[ ${KEV_SET[$cve]+x} ]]
+        then
+            KEV_MATCHES["$cve"]=1
+
+            ((TOTAL_KEV++))
+        fi
+
+    done
+
+}
+
+
+
+#---Local NVD cache Query----
+enrich_nvd_data() {
+
+    for cve in "${!KEV_MATCHES[@]}"
+    do
+
+        query_nvd "$cve"
+
+    done
+
+}
+
+#----Live API NVD Query------
+query_nvd() {
+    local cve="$1"
+    local cache_file
+    local response
+    local temporary_file
+
+    cache_file="$(get_nvd_cache_file "$cve")"
+
+    if [[ -s "$cache_file" ]] &&
+       jq -e '.vulnerabilities | type == "array"' \
+           "$cache_file" >/dev/null 2>&1; then
+
+        NVD_CACHE["$cve"]="$(<"$cache_file")"
+        return 0
     fi
 
-    curl  --retry 5 \
-      --connect-timeout 10 --max-time 90 \
-      -H "apiKey: $NVD_API_KEY" \
-      --get --data-urlencode "cveId=$cve_id" \
-      'https://services.nvd.nist.gov/rest/json/cves/2.0' \
-      > "$tmp"
+    temporary_file="${cache_file}.tmp.$$"
 
-    jq -e --arg id "$cve_id" '
-      .totalResults == 1 and
-      .vulnerabilities[0].cve.id == $id
-    ' "$tmp" >/dev/null
-      log INFO "NVD PASS $cve_id"
+    if ! curl \
+        --show-error \
+        --location \
+        --connect-timeout 10 \
+        --max-time 60 \
+        --retry 3 \
+        --retry-delay 2 \
+        --header "apiKey: ${NVD_API_KEY}" \
+        --get \
+        --data-urlencode "cveId=${cve}" \
+        "$NVD_API_URL" \
+        --output "$temporary_file"; then
 
-    jq --arg id "$cve_id" '
-    first(
-      .vulnerabilities[]
-      | select(.cveID == $id)
-    ) // null
-  ' "$KEV_FILE"
+        rm -f -- "$temporary_file"
+        echo "[!] NVD request failed for ${cve}" >&2
+        return 1
+    fi
+
+    if ! jq -e '.vulnerabilities | type == "array"' \
+        "$temporary_file" >/dev/null 2>&1; then
+
+        rm -f -- "$temporary_file"
+        echo "[!] Invalid NVD response for ${cve}" >&2
+        return 1
+    fi
+
+    mv -- "$temporary_file" "$cache_file"
+    NVD_CACHE["$cve"]="$(<"$cache_file")"
+}
+
+#---Build .json Report Records for report generation---
+build_report_dataset() {
+
+    for cve in "${!KEV_MATCHES[@]}"
+    do
+
+        build_finding_record "$cve"
+
+    done
+
+}
+
+#---Assemble nvd-kev records 
+build_finding_record() {
+
+    local cve="$1"
+
+    local nvd="${NVD_CACHE[$cve]}"
+
+    local cvss
+    local severity
+    local description
+
+    cvss="$(
+    jq -r '
+        .vulnerabilities[0].cve.metrics as $metrics
+        | (
+            $metrics.cvssMetricV31[0].cvssData.baseScore
+            // $metrics.cvssMetricV30[0].cvssData.baseScore
+            // $metrics.cvssMetricV2[0].cvssData.baseScore
+            // null
+        )
+      ' <<< "$nvd"
+    )"
+
+    severity=$(
+        jq -r '
+        .vulnerabilities[0]
+        .cve.metrics.cvssMetricV31[0]
+        .cvssData.baseSeverity
+        ' <<< "$nvd"
+    )
+
+    description="$(
+    jq -r '
+        first(
+            .vulnerabilities[0].cve.descriptions[]?
+            | select(.lang == "en")
+            | .value
+        ) // "No English NVD description available."
+    ' <<< "$nvd"
+)"
+
+    FINDINGS["$cve"]=$(
+        jq -nc \
+        --arg cve "$cve" \
+        --arg severity "$severity" \
+        --arg description "$description" \
+        --arg cvss "$cvss" \
+        --arg hosts "${CVE_HOSTS[$cve]}" \
+        '
+        {
+            cve:$cve,
+            severity:$severity,
+            cvss:$cvss,
+            description:$description,
+            hosts:$hosts
+        }
+        '
+    )
 
 }
 
 
+#---export final .json report database----
+export_report_json() {
+    local findings_json
 
-  
+    findings_json="$(
+        for cve in "${!FINDINGS[@]}"; do
+            printf '%s\n' "${FINDINGS[$cve]}"
+        done |
+            jq -s 'sort_by(.cve)'
+    )"
 
+    jq -n \
+        --arg run_id "$RUN_ID" \
+        --arg generated_at "$REPORT_DATE" \
+        --arg target "$target" \
+        --arg scan_type "$SCAN_NAME" \
+        --argjson findings "$findings_json" \
+        '{
+            schema_version: "1.0",
+            run_id: $run_id,
+            generated_at: $generated_at,
+            target: $target,
+            scan_type: $scan_type,
+            summary: {
+                finding_count: ($findings | length),
+                kev_count: ($findings | length)
+            },
+            findings: $findings
+        }' > "$REPORT_JSON"
+
+    jq empty "$REPORT_JSON" ||
+        error_exit "Generated report JSON failed validation."
+}
+
+finalize_successful_run() {
+    ln -sfn "$REPORT_DIR" "${REPORT_ROOT}/latest"
+
+    if [[ "${KEEP_ASSESSMENT_DATA:-0}" == "0" ]]; then
+        rm -rf -- "$RUN_DIR"
+    fi
+
+    printf '[+] JSON report: %s\n' "$REPORT_JSON"
+    [[ -s "$REPORT_HTML" ]] &&
+        printf '[+] HTML report: %s\n' "$REPORT_HTML"
+}
 
 # ---------- OLD Report Functions ----------
 
@@ -476,7 +1019,7 @@ write_vulns_section() {
     echo "### Vulnerabilities & CVEs"
     echo ""
 
-    if [[ -z "${XML_REPORT:-}" || ! -f "$XML_REPORT" ]]; then
+    if [[ -z "${:-}" || ! -f "$XML_REPORT" ]]; then
         echo "_Vulnerability XML dataset missing or unreachable._"
         echo ""
         return 0
@@ -613,26 +1156,20 @@ write_vulns_section() {
 }
 
 
-write_recs_section() {
-    echo "### Recommendations for Remediation"
-    echo
-    echo "- Update all exposed services to current supported versions."
-    echo "- Disable or restrict unnecessary ports and services."
-    echo "- Replace default or weak credentials immediately."
-    echo "- Apply host firewall rules and service hardening."
-    echo "- Review service exposure and segment sensitive systems."
-    echo
-}
 
-write_footer() {
-    echo "========================================="
-    echo "End of Report"
-}
+
 
 # ---------- Main Function ----------
-
+NMAP_CONSOLE_LOG="${LOG_DIR}/nmap-console.log"
 main() {
-    set -o pipefail
+    #Initialize Scan directory and files
+    initialize_runtime
+    validate_runtime_paths
+    create_assessment_manifest
+    refresh_kev_catalog
+    validate_pre_scan_inputs
+    load_kev_catalog
+    #Begin Scan Selection Output
     echo "========================================="
     echo "Network Security Scan Report Generator"
     echo "This Nmap scans runs in GNU Parallel"
@@ -696,7 +1233,7 @@ main() {
                 break
                 ;;
             2)
-                SCAN_COMMAND=(sudo nmap -sV -O -T3 -n -Pn "${PORT_ARGS[@]}" -oN "$RAW_SCAN_LOG" "$target")
+                SCAN_COMMAND=(sudo nmap -sV -O -T3 -n -Pn "${PORT_ARGS[@]}" -oA "$RAW_SCAN_LOG" "$target")
                 SCAN_NAME="Service + OS Detection (-sV -O)"
                 break
                 ;;
@@ -716,74 +1253,49 @@ main() {
 
     # Capture Nmap's complete console output for report parsing while also
     # displaying it live in the terminal.
-    stdbuf -oL -eL "${SCAN_COMMAND[@]}" 2>&1 | tee "$RAW_SCAN_LOG"
+    set +e
+
+    stdbuf -oL -eL "${SCAN_COMMAND[@]}" > >(tee -a "$NMAP_CONSOLE_LOG") 2>&1 &
+
     NMAP_PID=$!
-    wait "${NMAP_PID}"
+    wait "$NMAP_PID"
     scan_exit_code=$?
+
     unset NMAP_PID
+    set -e
+
     if (( scan_exit_code != 0 )); then
-      echo "ERROR: Nmap exited with status ${scan_exit_code}." >&2
-      return "$scan_exit_code"
+    error_exit "Nmap exited with status ${scan_exit_code}."
     fi
 
    
     # Generate final parsed markdown report
-    {
-    extract_unique_cve
-    cache_cve_details
-    write_header "$target" "$SCAN_NAME"
-    write_ports_section
-    write_vulns_section
-    write_recs_section
-    write_footer
-} > "$OUTPUT_FILE"
+    echo "Validating Scan Output"
+    validate_post_scan_outputs
+    echo "Parsing Report XML Results"
+    parse_nmap_xml
+    echo "Dedeplicating XML CVE Results"
+    deduplicate_cves
+    echo "Matching CVE Results to KEV Database"
+    validate_kev_matches
+    echo "Sourcing NVD CVE Information from NIST"
+    enrich_nvd_data
+    echo "Building Report Database"
+    build_report_dataset
+    echo "Exporing Report Json file for Report Compilation"
+    export_report_json
+    echo "Exporting Results to Archive Directory"
+    finalize_successful_run
+
+
 
     # Print the report output to standard output BEFORE archiving files
     echo; echo "========== REPORT =========="
-    cat "$OUTPUT_FILE"
+    echo "$OUTPUT_FILE"
     echo "============================"
-    # Archieve Raw Log Data For Review
     echo
 echo "Archiving scan data to log vault"
 
-# Archive completed report.
-if [[ -s "$OUTPUT_FILE" ]]; then
-    mv -- "$OUTPUT_FILE" "$FINAL_REPORT"
-    OUTPUT_FILE="$FINAL_REPORT"
-
-    echo "  [+] Saved Report: $FINAL_REPORT"
-else
-    echo "  [!] Report is missing or empty: $OUTPUT_FILE" >&2
-    return 1
-fi
-
-# Archive raw Nmap log.
-if [[ -s "$RAW_SCAN_LOG" ]]; then
-    raw_log_name="$(basename "$RAW_SCAN_LOG")"
-    final_raw_log="${LOGS_DIR}/${raw_log_name}"
-
-    mv -- "$RAW_SCAN_LOG" "$final_raw_log"
-    RAW_SCAN_LOG="$final_raw_log"
-
-    echo "  [+] Saved Raw Log: $final_raw_log"
-else
-    echo "  [!] Raw scan log is missing or empty: $RAW_SCAN_LOG" >&2
-fi
-
-# Archive XML when generated.
-if [[ -n "${XML_REPORT:-}" && -s "$XML_REPORT" ]]; then
-    xml_report_name="$(basename "$XML_REPORT")"
-    final_xml_report="${XML_DIR}/${xml_report_name}"
-
-    mv -- "$XML_REPORT" "$final_xml_report"
-    XML_REPORT="$final_xml_report"
-
-    echo "  [+] Saved XML Data: $final_xml_report"
-fi
-
-
-    echo; echo "All processing tasks complete! Vault archived."
-    echo
 }
 
 main "$@"
