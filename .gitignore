@@ -17,3 +17,4 @@ scanner.conf
 /.landscape/
 /.git/
 networkscannerv3.sh
+/reports/latest
