@@ -935,85 +935,146 @@ query_nvd() {
 #---Build .json Report Records for report generation---
 build_report_dataset() {
     local cve
+    local built_count=0
+    local skipped_count=0
 
     for cve in "${!KEV_MATCHES[@]}"; do
-        if [[ -n "${NVD_CACHE[$cve]+present}" ]]; then
-            build_finding_record "$cve"
+        if [[ -z "${NVD_CACHE[$cve]+present}" ]]; then
+            printf '[!] No NVD cache entry for %s; skipping finding.\n' \
+                "$cve" >&2
+
+            skipped_count=$((skipped_count + 1))
+            continue
+        fi
+
+        if build_finding_record "$cve"; then
+            built_count=$((built_count + 1))
         else
-            echo "[!] No NVD record available for ${cve}; skipping finding." >&2
+            skipped_count=$((skipped_count + 1))
         fi
     done
+
+    printf '[+] Report records built: %d\n' "$built_count"
+    printf '[+] Report records skipped: %d\n' "$skipped_count"
 }
 
 #---Assemble nvd-kev records 
 build_finding_record() {
-
     local cve="$1"
-
     local nvd="${NVD_CACHE[$cve]:-}"
-
-    if [[ -z "$nvd" ]]; then
-      printf '[!] No NVD data is available for %s; skipping finding.\n' \
-        "$cve" >&2
-      return 0
-    fi  
-
+    local kev_record="${KEV_RECORDS[$cve]:-}"
+    local kev_vendor=""
+    local kev_product=""
+    local kev_date_added=""
     local cvss
     local severity
     local description
 
+    if [[ -z "$nvd" ]]; then
+        printf '[!] No NVD data is available for %s; skipping finding.\n' \
+            "$cve" >&2
+        return 0
+    fi
+
+    if ! jq -e '
+        .vulnerabilities
+        | type == "array" and length > 0
+    ' <<< "$nvd" >/dev/null 2>&1; then
+        printf '[!] NVD data for %s does not contain a vulnerability record.\n' \
+            "$cve" >&2
+        return 0
+    fi
+
+    IFS='|' read -r \
+        kev_vendor \
+        kev_product \
+        kev_date_added \
+        <<< "$kev_record"
+
     cvss="$(
-    jq -r '
-        .vulnerabilities[0].cve.metrics as $metrics
-        | (
-            $metrics.cvssMetricV31[0].cvssData.baseScore
-            // $metrics.cvssMetricV30[0].cvssData.baseScore
-            // $metrics.cvssMetricV2[0].cvssData.baseScore
-            // null
-        )
-      ' <<< "$nvd"
+        jq -r '
+            .vulnerabilities[0].cve.metrics as $metrics
+            | (
+                $metrics.cvssMetricV31[0].cvssData.baseScore
+                // $metrics.cvssMetricV30[0].cvssData.baseScore
+                // $metrics.cvssMetricV2[0].cvssData.baseScore
+                // null
+            )
+        ' <<< "$nvd"
     )"
 
     severity="$(
-    jq -r '
-        .vulnerabilities[0].cve.metrics as $metrics
-        | (
-            $metrics.cvssMetricV31[0].cvssData.baseSeverity
-            // $metrics.cvssMetricV30[0].cvssData.baseSeverity
-            // $metrics.cvssMetricV2[0].baseSeverity
-            // "UNKNOWN"
-        )
-    ' <<< "$nvd"
-)"
+        jq -r '
+            .vulnerabilities[0].cve.metrics as $metrics
+            | (
+                $metrics.cvssMetricV31[0].cvssData.baseSeverity
+                // $metrics.cvssMetricV30[0].cvssData.baseSeverity
+                // $metrics.cvssMetricV2[0].baseSeverity
+                // "UNKNOWN"
+            )
+        ' <<< "$nvd"
+    )"
+
     description="$(
-    jq -r '
-        first(
-            .vulnerabilities[0].cve.descriptions[]?
-            | select(.lang == "en")
-            | .value
-        ) // "No English NVD description available."
-    ' <<< "$nvd"
-)"
+        jq -r '
+            first(
+                .vulnerabilities[0].cve.descriptions[]?
+                | select(.lang == "en")
+                | .value
+            ) // "No English NVD description is available."
+        ' <<< "$nvd"
+    )"
 
-    FINDINGS["$cve"]=$(
-        jq -nc \
-        --arg cve "$cve" \
-        --arg severity "$severity" \
-        --arg description "$description" \
-        --arg cvss "$cvss" \
-        --arg hosts "${CVE_HOSTS[$cve]:-}" \
-        --arg ports "${CVE_PORTS[$cve]:-}"
-        '
-        {
-            cve:$cve,
-            severity:$severity,
-            cvss:$cvss,
-            description:$description,
-            hosts:$hosts
-        }
-        '
-    )
+    FINDINGS["$cve"]="$(
+        jq -n \
+            --arg cve "$cve" \
+            --arg severity "$severity" \
+            --arg description "$description" \
+            --arg hosts "${CVE_HOSTS[$cve]:-}" \
+            --arg ports "${CVE_PORTS[$cve]:-}" \
+            --arg kev_vendor "$kev_vendor" \
+            --arg kev_product "$kev_product" \
+            --arg kev_date_added "$kev_date_added" \
+            --argjson cvss "${cvss:-null}" \
+            '{
+                cve: $cve,
+                kev: {
+                    listed: true,
+                    vendor_project: $kev_vendor,
+                    product: $kev_product,
+                    date_added: $kev_date_added
+                },
+                nvd: {
+                    severity: $severity,
+                    cvss: $cvss,
+                    description: $description
+                },
+                discovery: {
+                    hosts: (
+                        $hosts
+                        | split(";")
+                        | map(select(length > 0))
+                        | unique
+                    ),
+                    ports: (
+                        $ports
+                        | split(";")
+                        | map(select(length > 0))
+                        | unique
+                    )
+                }
+            }'
+    )"
 
+    if ! jq -e . <<< "${FINDINGS[$cve]}" >/dev/null 2>&1; then
+        unset 'FINDINGS[$cve]'
+
+        printf '[!] Failed to construct valid finding JSON for %s.\n' \
+            "$cve" >&2
+        return 1
+    fi
+
+    printf '[+] Built report record for %s.\n' 
 }
 
 
@@ -1024,12 +1085,16 @@ export_report_json() {
     local kev_count="${#KEV_MATCHES[@]}"
     local enriched_count="${#FINDINGS[@]}"
 
-    findings_json="$(
-        for cve in "${!FINDINGS[@]}"; do
-            printf '%s\n' "${FINDINGS[$cve]}"
-        done |
-            jq -s 'sort_by(.cve)'
-    )"
+    if (( enriched_count > 0 )); then
+        findings_json="$(
+            for cve in "${!FINDINGS[@]}"; do
+                printf '%s\n' "${FINDINGS[$cve]}"
+            done |
+                jq -s 'sort_by(.cve)'
+        )"
+    else
+        findings_json='[]'
+    fi
 
     jq -n \
         --arg run_id "$RUN_ID" \
@@ -1037,6 +1102,9 @@ export_report_json() {
         --arg target "$target" \
         --arg scan_type "$SCAN_NAME" \
         --arg nmap_xml "$SCAN_XML" \
+        --arg nmap_normal "$RAW_SCAN_LOG" \
+        --arg nmap_grepable "$SCAN_GNMAP" \
+        --arg nmap_console_log "$NMAP_CONSOLE_LOG" \
         --argjson discovered_count "$discovered_count" \
         --argjson kev_count "$kev_count" \
         --argjson enriched_count "$enriched_count" \
@@ -1048,7 +1116,10 @@ export_report_json() {
             target: $target,
             scan_type: $scan_type,
             source_files: {
-                nmap_xml: $nmap_xml
+                nmap_xml: $nmap_xml,
+                nmap_normal: $nmap_normal,
+                nmap_grepable: $nmap_grepable,
+                nmap_console_log: $nmap_console_log
             },
             summary: {
                 discovered_cve_count: $discovered_count,
@@ -1058,11 +1129,13 @@ export_report_json() {
             findings: $findings
         }' > "$REPORT_JSON"
 
-    jq empty "$REPORT_JSON" ||
-        error_exit "Generated report JSON failed validation."
+    if ! jq -e . "$REPORT_JSON" >/dev/null 2>&1; then
+        error_exit "Generated report JSON failed validation: $REPORT_JSON"
+    fi
 
-    printf '[+] Report JSON contains %d enriched findings.\n' \
-        "$enriched_count"
+    printf '[+] Exported report JSON with %d finding(s): %s\n' \
+        "$enriched_count" \
+        "$REPORT_JSON"
 }
 
 finalize_successful_run() {
