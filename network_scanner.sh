@@ -714,14 +714,12 @@ parse_nmap_xml() {
     local port
     local service
     local cve
-    local extracted_count=0
+    local occurrence_count=0
     local normalized_file="${NORMALIZED_DIR}/vulners-cve-records.tsv"
 
     : > "$normalized_file"
 
     while IFS='|' read -r host port service cve; do
-        [[ -n "$host" ]] || continue
-        [[ -n "$port" ]] || continue
         [[ "$cve" =~ ^CVE-[0-9]{4}-[0-9]{4,}$ ]] || continue
 
         register_cve \
@@ -736,26 +734,21 @@ parse_nmap_xml() {
             "$service" \
             "$cve" >> "$normalized_file"
 
-        ((extracted_count += 1))
+        occurrence_count=$((occurrence_count + 1))
     done < <(
         extract_vulners_records
     )
 
     TOTAL_CVES="${#DISCOVERED_CVES[@]}"
 
-    printf '[+] Extracted %d Vulners occurrences.\n' \
-        "$extracted_count"
+    printf '[+] Parsed CVE occurrences: %d\n' \
+        "$occurrence_count"
 
-    printf '[+] Registered %d unique CVEs.\n' \
+    printf '[+] Unique discovered CVEs: %d\n' \
         "$TOTAL_CVES"
 
-    printf '[+] Normalized records: %s\n' \
+    printf '[+] Normalized CVE records: %s\n' \
         "$normalized_file"
-
-    if (( TOTAL_CVES == 0 )); then
-        echo "[!] No CVEs were extracted from the Vulners XML output." >&2
-        echo "[!] Inspect the XML structure before continuing: $SCAN_XML" >&2
-    fi
 }
 
 #---Build in memory catalog of mathcing NMAP-KEV matches---
@@ -817,16 +810,19 @@ extract_vulners_records() {
 register_cve() {
     local host="$1"
     local port="$2"
-    local service="$3"
+    local service="${3:-unknown}"
     local cve="${4^^}"
 
     [[ "$cve" =~ ^CVE-[0-9]{4}-[0-9]{4,}$ ]] || return 0
+    [[ -n "$host" ]] || return 0
+    [[ -n "$port" ]] || return 0
 
     DISCOVERED_CVES["$cve"]=1
-    ((CVE_COUNTS["$cve"] += 1))
 
-    CVE_HOSTS["$cve"]+="${host};"
-    CVE_PORTS["$cve"]+="${port}:${service};"
+    CVE_COUNTS["$cve"]=$(( ${CVE_COUNTS[$cve]:-0} + 1 ))
+
+    CVE_HOSTS["$cve"]="${CVE_HOSTS[$cve]:-}${host};"
+    CVE_PORTS["$cve"]="${CVE_PORTS[$cve]:-}${port}:${service};"
 }
 
 #---De-deplicate CVE findings-----
@@ -848,7 +844,7 @@ validate_kev_matches() {
     for cve in "${UNIQUE_CVES[@]}"; do
         if [[ -n "${KEV_SET[$cve]+present}" ]]; then
             KEV_MATCHES["$cve"]=1
-            ((TOTAL_KEV += 1))
+            TOTAL_KEV=$((TOTAL_KEV + 1))
         fi
     done
 
@@ -954,7 +950,13 @@ build_finding_record() {
 
     local cve="$1"
 
-    local nvd="${NVD_CACHE[$cve]}"
+    local nvd="${NVD_CACHE[$cve]:-}"
+
+    if [[ -z "$nvd" ]]; then
+      printf '[!] No NVD data is available for %s; skipping finding.\n' \
+        "$cve" >&2
+      return 0
+    fi  
 
     local cvss
     local severity
@@ -999,7 +1001,8 @@ build_finding_record() {
         --arg severity "$severity" \
         --arg description "$description" \
         --arg cvss "$cvss" \
-        --arg hosts "${CVE_HOSTS[$cve]}" \
+        --arg hosts "${CVE_HOSTS[$cve]:-}" \
+        --arg ports "${CVE_PORTS[$cve]:-}"
         '
         {
             cve:$cve,
