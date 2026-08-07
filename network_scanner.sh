@@ -9,7 +9,7 @@ set -Eeuo pipefail
 #------------cleanup logic-----------
 remove_partial_scan_artifacts() {
 local artifact
- 
+
 # Do not continue unless the required paths are initialized.
 if [[ -z "${RUN_DIR:-}" ||
 -z "${RAW_NMAP_DIR:-}" ||
@@ -18,7 +18,7 @@ printf '[!] Runtime paths are incomplete; skipping artifact cleanup.\n' \
 >&2
 return 0
 fi
- 
+
 # Safety boundary: only operate inside this assessment's Nmap directory.
 case "$BASE_PATH" in
 "${RAW_NMAP_DIR}/"*)
@@ -29,13 +29,13 @@ printf '[!] Refusing cleanup outside RAW_NMAP_DIR: %s\n' \
 return 0
 ;;
 esac
- 
+
 local -a partial_artifacts=(
 "${BASE_PATH}.nmap"
 "${BASE_PATH}.xml"
 "${BASE_PATH}.gnmap"
 )
- 
+
 for artifact in "${partial_artifacts[@]}"; do
 if [[ -e "$artifact" || -L "$artifact" ]]; then
 chmod u+w -- "$artifact" 2>/dev/null || true
@@ -138,6 +138,7 @@ BASE_PATH="${RAW_NMAP_DIR}/${SCAN_BASENAME}"
 RAW_SCAN_LOG="${BASE_PATH}.nmap"
 SCAN_XML="${BASE_PATH}.xml"
 SCAN_GNMAP="${BASE_PATH}.gnmap"
+KEEP_ASSESSMENT_DATA=1
 
 # Compatibility aliases while old report functions remain.
 XML_REPORT="$SCAN_XML"
@@ -709,9 +710,19 @@ load_kev_catalog() {
 
 #---Extract KEV mathces from Nmap XML----
 parse_nmap_xml() {
+    local host
+    local port
+    local service
+    local cve
+    local extracted_count=0
+    local normalized_file="${NORMALIZED_DIR}/vulners-cve-records.tsv"
 
-    while IFS='|' read -r host port service cve
-    do
+    : > "$normalized_file"
+
+    while IFS='|' read -r host port service cve; do
+        [[ -n "$host" ]] || continue
+        [[ -n "$port" ]] || continue
+        [[ "$cve" =~ ^CVE-[0-9]{4}-[0-9]{4,}$ ]] || continue
 
         register_cve \
             "$host" \
@@ -719,24 +730,87 @@ parse_nmap_xml() {
             "$service" \
             "$cve"
 
+        printf '%s\t%s\t%s\t%s\n' \
+            "$host" \
+            "$port" \
+            "$service" \
+            "$cve" >> "$normalized_file"
+
+        ((extracted_count += 1))
     done < <(
-
         extract_vulners_records
-
     )
 
+    TOTAL_CVES="${#DISCOVERED_CVES[@]}"
+
+    printf '[+] Extracted %d Vulners occurrences.\n' \
+        "$extracted_count"
+
+    printf '[+] Registered %d unique CVEs.\n' \
+        "$TOTAL_CVES"
+
+    printf '[+] Normalized records: %s\n' \
+        "$normalized_file"
+
+    if (( TOTAL_CVES == 0 )); then
+        echo "[!] No CVEs were extracted from the Vulners XML output." >&2
+        echo "[!] Inspect the XML structure before continuing: $SCAN_XML" >&2
+    fi
 }
 
 #---Build in memory catalog of mathcing NMAP-KEV matches---
+
 extract_vulners_records() {
+    local extracted_count=0
+    local host
+    local port
+    local service
+    local vulnerability_text
+    local cve
 
-    xmlstarlet sel \
-        -t \
-        -m "//host" \
-        -v "address/@addr" \
-        -n \
-        "$SCAN_XML"
+    # First attempt: structured Vulners XML elements.
+    while IFS=$'\t' read -r \
+        host \
+        port \
+        service \
+        vulnerability_text; do
 
+        [[ -n "$host" && -n "$port" ]] || continue
+        service="${service:-unknown}"
+
+        while IFS= read -r cve; do
+            [[ -n "$cve" ]] || continue
+
+            printf '%s|%s|%s|%s\n' \
+                "$host" \
+                "$port" \
+                "$service" \
+                "$cve"
+
+            ((extracted_count += 1))
+        done < <(
+            grep -oE 'CVE-[0-9]{4}-[0-9]{4,}' \
+                <<< "$vulnerability_text" |
+                sort -u
+        )
+    done < <(
+        xmlstarlet sel \
+            -t \
+            -m '//host/ports/port/script[@id="vulners"]//elem[contains(., "CVE-")]' \
+            -v 'ancestor::host[1]/address[@addrtype="ipv4"][1]/@addr' \
+            -o $'\t' \
+            -v 'ancestor::port[1]/@portid' \
+            -o $'\t' \
+            -v 'ancestor::port[1]/service/@name' \
+            -o $'\t' \
+            -v '.' \
+            -n \
+            "$SCAN_XML"
+    )
+
+    # The structured extraction is preferred. A later fallback can be
+    # added for script/@output if testing shows the current Vulners
+    # version does not emit nested elem records.
 }
 
 #---Build CVE List for report generation in memory----
@@ -766,33 +840,51 @@ deduplicate_cves() {
 
 #-----Validate Kev Matcches-----
 validate_kev_matches() {
+    local cve
 
-    for cve in "${UNIQUE_CVES[@]}"
-    do
+    KEV_MATCHES=()
+    TOTAL_KEV=0
 
-        if [[ ${KEV_SET[$cve]+x} ]]
-        then
+    for cve in "${UNIQUE_CVES[@]}"; do
+        if [[ -n "${KEV_SET[$cve]+present}" ]]; then
             KEV_MATCHES["$cve"]=1
-
-            ((TOTAL_KEV++))
+            ((TOTAL_KEV += 1))
         fi
-
     done
 
+    printf '[+] Vulners unique CVEs: %d\n' \
+        "${#UNIQUE_CVES[@]}"
+
+    printf '[+] CISA KEV matches:    %d\n' \
+        "$TOTAL_KEV"
+
+    if (( ${#UNIQUE_CVES[@]} > 0 && TOTAL_KEV == 0 )); then
+        echo "[!] CVEs were extracted, but none matched the CISA KEV catalog."
+    fi
 }
 
 
 
 #---Local NVD cache Query----
 enrich_nvd_data() {
+    local cve
+    local success_count=0
+    local failure_count=0
 
-    for cve in "${!KEV_MATCHES[@]}"
-    do
+    for cve in "${!KEV_MATCHES[@]}"; do
+        echo "[+] Retrieving NVD data for ${cve}..."
 
-        query_nvd "$cve"
-
+        if query_nvd "$cve"; then
+            ((success_count += 1))
+        else
+            ((failure_count += 1))
+            echo "[!] NVD enrichment failed for ${cve}; continuing." >&2
+        fi
     done
 
+    printf '[+] NVD enrichment completed: %d succeeded, %d failed.\n' \
+        "$success_count" \
+        "$failure_count"
 }
 
 #----Live API NVD Query------
@@ -846,14 +938,15 @@ query_nvd() {
 
 #---Build .json Report Records for report generation---
 build_report_dataset() {
+    local cve
 
-    for cve in "${!KEV_MATCHES[@]}"
-    do
-
-        build_finding_record "$cve"
-
+    for cve in "${!KEV_MATCHES[@]}"; do
+        if [[ -n "${NVD_CACHE[$cve]+present}" ]]; then
+            build_finding_record "$cve"
+        else
+            echo "[!] No NVD record available for ${cve}; skipping finding." >&2
+        fi
     done
-
 }
 
 #---Assemble nvd-kev records 
@@ -879,14 +972,17 @@ build_finding_record() {
       ' <<< "$nvd"
     )"
 
-    severity=$(
-        jq -r '
-        .vulnerabilities[0]
-        .cve.metrics.cvssMetricV31[0]
-        .cvssData.baseSeverity
-        ' <<< "$nvd"
-    )
-
+    severity="$(
+    jq -r '
+        .vulnerabilities[0].cve.metrics as $metrics
+        | (
+            $metrics.cvssMetricV31[0].cvssData.baseSeverity
+            // $metrics.cvssMetricV30[0].cvssData.baseSeverity
+            // $metrics.cvssMetricV2[0].baseSeverity
+            // "UNKNOWN"
+        )
+    ' <<< "$nvd"
+)"
     description="$(
     jq -r '
         first(
@@ -921,6 +1017,9 @@ build_finding_record() {
 #---export final .json report database----
 export_report_json() {
     local findings_json
+    local discovered_count="${#DISCOVERED_CVES[@]}"
+    local kev_count="${#KEV_MATCHES[@]}"
+    local enriched_count="${#FINDINGS[@]}"
 
     findings_json="$(
         for cve in "${!FINDINGS[@]}"; do
@@ -934,6 +1033,10 @@ export_report_json() {
         --arg generated_at "$REPORT_DATE" \
         --arg target "$target" \
         --arg scan_type "$SCAN_NAME" \
+        --arg nmap_xml "$SCAN_XML" \
+        --argjson discovered_count "$discovered_count" \
+        --argjson kev_count "$kev_count" \
+        --argjson enriched_count "$enriched_count" \
         --argjson findings "$findings_json" \
         '{
             schema_version: "1.0",
@@ -941,29 +1044,46 @@ export_report_json() {
             generated_at: $generated_at,
             target: $target,
             scan_type: $scan_type,
+            source_files: {
+                nmap_xml: $nmap_xml
+            },
             summary: {
-                finding_count: ($findings | length),
-                kev_count: ($findings | length)
+                discovered_cve_count: $discovered_count,
+                kev_match_count: $kev_count,
+                enriched_finding_count: $enriched_count
             },
             findings: $findings
         }' > "$REPORT_JSON"
 
     jq empty "$REPORT_JSON" ||
         error_exit "Generated report JSON failed validation."
+
+    printf '[+] Report JSON contains %d enriched findings.\n' \
+        "$enriched_count"
 }
 
 finalize_successful_run() {
-    ln -sfn "$REPORT_DIR" "${REPORT_ROOT}/latest"
+    local latest_link="${REPORT_ROOT}/latest"
 
-    if [[ "${KEEP_ASSESSMENT_DATA:-0}" == "0" ]]; then
+    ln -sfn "$REPORT_DIR" "$latest_link"
+
+    printf '\n[+] Assessment completed successfully.\n'
+    printf '[+] JSON report:      %s\n' "$REPORT_JSON"
+    printf '[+] Nmap XML:         %s\n' "$SCAN_XML"
+    printf '[+] Nmap normal:      %s\n' "$RAW_SCAN_LOG"
+    printf '[+] Nmap grepable:    %s\n' "$SCAN_GNMAP"
+    printf '[+] Nmap console log: %s\n' "$NMAP_CONSOLE_LOG"
+    printf '[+] Assessment data:  %s\n' "$RUN_DIR"
+
+    if [[ "${KEEP_ASSESSMENT_DATA:-1}" == "0" ]]; then
+        archive_assessment_evidence
         rm -rf -- "$RUN_DIR"
+
+        printf '[+] Temporary assessment workspace removed.\n'
+    else
+        printf '[+] Assessment workspace retained.\n'
     fi
-
-    printf '[+] JSON report: %s\n' "$REPORT_JSON"
-    [[ -s "$REPORT_HTML" ]] &&
-        printf '[+] HTML report: %s\n' "$REPORT_HTML"
 }
-
 # ---------- OLD Report Functions ----------
 
 write_header() {
@@ -1233,7 +1353,7 @@ main() {
                 break
                 ;;
             2)
-                SCAN_COMMAND=(sudo nmap -sV -O -T3 -n -Pn "${PORT_ARGS[@]}" -oA "$RAW_SCAN_LOG" "$target")
+                SCAN_COMMAND=(sudo nmap -sV -O -T3 -n -Pn "${PORT_ARGS[@]}" -oA "$BASE_PATH" "$target")
                 SCAN_NAME="Service + OS Detection (-sV -O)"
                 break
                 ;;
