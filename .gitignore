@@ -6,5 +6,14 @@
 report-*.txt
 /assessments/
 /cache/
-/reports/
+/reports/20*/
 scanner.conf
+.profile
+.bash_logout
+.bashrc
+.motd_shown
+scanner.conf
+/.ssh/
+/.landscape/
+/.git/
+networkscannerv3.sh
