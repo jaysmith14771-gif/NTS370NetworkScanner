@@ -54,10 +54,6 @@ readonly NVD_API_URL="https://services.nvd.nist.gov/rest/json/cves/2.0"
 
 readonly KEV_URL="https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 
-# MITRE CWE REST API. Raw responses are retained in a persistent local cache;
-# compact weakness records are joined into report.json for offline HTML use.
-readonly CWE_API_URL="https://cwe-api.mitre.org/api/v1/cwe"
-
 # ==================================================
 # Permanent Storage
 # ==================================================
@@ -67,9 +63,6 @@ CACHE_ROOT="${SCRIPT_DIR}/cache"
 KEV_CACHE_DIR="${CACHE_ROOT}/kev"
 
 NVD_CACHE_DIR="${CACHE_ROOT}/nvd"
-
-CWE_CACHE_DIR="${CACHE_ROOT}/cwe"
-CWE_CATALOG_JSON="${CWE_CACHE_DIR}/cwe-cache.json"
 
 REPORT_ROOT="${SCRIPT_DIR}/reports"
 
@@ -103,7 +96,7 @@ REPORT_DIR="${REPORT_ROOT}/${RUN_ID}"
 
 REPORT_JSON="${REPORT_DIR}/report.json"
 
-REPORT_HTML="${REPORT_DIR}/${RUN_ID}-report.html"
+REPORT_HTML="${REPORT_DIR}/report.html"
 
 # Resolve the project HTML schema from the directory where the scanner was
 # launched. A configured absolute HTML_SCHEMA_FILE is used unchanged; a relative
@@ -577,7 +570,6 @@ initialize_runtime() {
         "$CACHE_ROOT" \
         "$KEV_CACHE_DIR" \
         "$NVD_CACHE_DIR" \
-        "$CWE_CACHE_DIR" \
         "$ASSESSMENT_ROOT" \
         "$RUN_DIR" \
         "$RAW_DIR" \
@@ -597,7 +589,6 @@ validate_runtime_paths() {
     local required_directories=(
         "$KEV_CACHE_DIR"
         "$NVD_CACHE_DIR"
-        "$CWE_CACHE_DIR"
         "$RUN_DIR"
         "$RAW_NMAP_DIR"
         "$LOG_DIR"
@@ -972,25 +963,6 @@ calculate_exploitability() {
     else echo "None"; fi
 }
 
-
-# Detect NVD API key to set rate limit. valid http response gets 45 requests per 30 seconds, and any other http code sets 4 requests per 30 seconds
-configure_nvd_delay() {
-    local code
-
-    code="$(
-        curl -s -o /dev/null -w '%{http_code}' \
-            --header "apiKey: ${NVD_API_KEY}" \
-            --get \
-            --data-urlencode 'cveId=CVE-2024-0001' \
-            "$NVD_API_URL"
-    )"
-
-    case "$code" in
-        200) NVD_DELAY=0.7 ;;  # valid key
-        401|403) NVD_DELAY=7 ;; # bad key
-        *) NVD_DELAY=8 ;;
-    esac
-}
 # Query and cache one NVD CVE record. API failures are nonfatal so the report
 # can preserve observed scanner evidence even when NVD is unavailable.
 query_nvd() {
@@ -1014,7 +986,7 @@ query_nvd() {
         '.vulnerabilities[0].cve.id == $cve' "$temporary_file" >/dev/null 2>&1; then
         mv -- "$temporary_file" "$cache_file"
         NVD_CACHE["$cve"]="$(<"$cache_file")"
-        [[ -n "${NVD_API_KEY:-}" ]] || sleep "${NVD_DELAY:-7}"
+        [[ -n "${NVD_API_KEY:-}" ]] || sleep 6
         return 0
     fi
 
@@ -1051,320 +1023,6 @@ classify_reference_url() {
         *github.com*|*gitlab.com*|*gitee.com*) printf 'research\n' ;;
         *) printf 'other\n' ;;
     esac
-}
-
-# Build or refresh the one persistent CWE JSON cache. Downloaded ZIP/XML
-# content exists only inside a temporary staging directory and is destroyed after
-# an atomic, validated cache replacement.
-update_cwe_cache() {
-    local expected_version="${1:-}"
-    local source_url="${CWE_CATALOG_URL:-https://cwe.mitre.org/data/xml/cwec_latest.xml.zip}"
-    local stage xml_file entry_count generated_version
-
-    mkdir -p -- "$CWE_CACHE_DIR"
-    stage="$(mktemp -d "${CWE_CACHE_DIR}/.cwe-update.XXXXXX")" || return 1
-
-    cleanup_cwe_update_stage() {
-        rm -rf -- "$stage"
-    }
-
-    printf '[+] Downloading complete MITRE CWE release for the single-file cache...\n'
-    if ! curl --fail --silent --show-error --location --http1.1 \
-        --retry 6 --retry-all-errors --retry-delay 3 \
-        --connect-timeout 30 --max-time 600 \
-        --header 'User-Agent: Secure-Network-Report-CWE-Cache/2.1' \
-        "$source_url" -o "$stage/cwe.zip"; then
-        cleanup_cwe_update_stage
-        return 1
-    fi
-
-    if ! unzip -q "$stage/cwe.zip" -d "$stage/xml"; then
-        cleanup_cwe_update_stage
-        return 1
-    fi
-    xml_file="$(find "$stage/xml" -type f -name '*.xml' -print -quit)"
-    if [[ -z "$xml_file" || ! -s "$xml_file" ]]; then
-        printf '[!] Complete CWE release did not contain a usable XML file.\n' >&2
-        cleanup_cwe_update_stage
-        return 1
-    fi
-
-    if ! python3 - "$xml_file" "$stage/cwe-cache.json" "$expected_version" <<'PY_CWE_CACHE'
-import json
-import sys
-import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
-
-source_path, destination_path, expected_version = sys.argv[1:]
-root = ET.parse(source_path).getroot()
-
-def local_name(tag):
-    return tag.rsplit("}", 1)[-1]
-
-def json_key(name):
-    parts = name.replace("-", "_").split("_")
-    return parts[0] + "".join(part[:1].upper() + part[1:] for part in parts[1:])
-
-def convert(element):
-    result = {json_key(local_name(key)): value for key, value in element.attrib.items()}
-    children = list(element)
-    text = (element.text or "").strip()
-    if not children:
-        if result:
-            if text:
-                result["Value"] = text
-            return result
-        return text
-    grouped = {}
-    for child in children:
-        grouped.setdefault(local_name(child.tag), []).append(convert(child))
-    for name, values in grouped.items():
-        result[json_key(name)] = values if len(values) > 1 else values[0]
-    if text:
-        result["Value"] = text
-    return result
-
-entries = {}
-counts = {"weakness": 0, "category": 0, "view": 0}
-entry_groups = (
-    ("Weaknesses", "weakness", "Weaknesses"),
-    ("Categories", "category", "Categories"),
-    ("Views", "view", "Views"),
-)
-for container_name, entry_type, wrapper in entry_groups:
-    for container in root.iter():
-        if local_name(container.tag) != container_name:
-            continue
-        for element in list(container):
-            entry_id = element.attrib.get("ID") or element.attrib.get("Id") or element.attrib.get("id")
-            if not entry_id or entry_id in entries:
-                continue
-            record = convert(element)
-            record["EntryType"] = entry_type
-            entries[str(entry_id)] = {wrapper: [record]}
-            counts[entry_type] += 1
-
-version = str(root.attrib.get("Version") or root.attrib.get("version") or expected_version or "")
-if expected_version and version and expected_version != version:
-    raise SystemExit(f"CWE release mismatch: API={expected_version}, download={version}")
-if len(entries) < 500:
-    raise SystemExit(f"Incomplete CWE cache: only {len(entries)} entries were converted")
-
-payload = {
-    "catalog": {
-        "source": "MITRE CWE",
-        "version": version,
-        "updatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "entryCount": len(entries),
-        "counts": counts,
-    },
-    "entries": entries,
-}
-with open(destination_path, "w", encoding="utf-8") as output:
-    json.dump(payload, output, ensure_ascii=False, separators=(",", ":"))
-PY_CWE_CACHE
-    then
-        cleanup_cwe_update_stage
-        return 1
-    fi
-
-    if ! python3 -m json.tool "$stage/cwe-cache.json" >/dev/null 2>&1; then
-        cleanup_cwe_update_stage
-        return 1
-    fi
-    entry_count="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["catalog"]["entryCount"])' "$stage/cwe-cache.json")"
-    generated_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["catalog"]["version"])' "$stage/cwe-cache.json")"
-    if [[ ! "$entry_count" =~ ^[0-9]+$ ]] || ((entry_count < 500)); then
-        printf '[!] Generated CWE cache failed the minimum entry-count check.\n' >&2
-        cleanup_cwe_update_stage
-        return 1
-    fi
-
-    # The old cache remains available until the complete replacement has passed
-    # all checks. mv within the cache directory performs an atomic replacement.
-    chmod 0644 "$stage/cwe-cache.json"
-    mv -f -- "$stage/cwe-cache.json" "$CWE_CATALOG_JSON"
-    cleanup_cwe_update_stage
-    printf '[+] Single CWE cache updated: version=%s entries=%s file=%s\n' \
-        "$generated_version" "$entry_count" "$CWE_CATALOG_JSON"
-}
-
-# Compare the single local CWE cache release with the CWE API release. The
-# comparison runs once per scanner execution. Network failure never destroys or
-# blocks use of a valid installed cache.
-ensure_cwe_cache_current() {
-    local remote_payload remote_version local_version
-
-    [[ -s "$CWE_CATALOG_JSON" ]] || {
-        update_cwe_cache || return 1
-        return 0
-    }
-
-    local_version="$(jq -r '.catalog.version // empty' "$CWE_CATALOG_JSON" 2>/dev/null || true)"
-    remote_payload="$(curl --fail --silent --show-error --location --http1.1 \
-        --retry 3 --retry-all-errors --retry-delay 2 \
-        --connect-timeout 15 --max-time 60 \
-        --header 'Accept: application/json' \
-        --header 'User-Agent: Secure-Network-Report-CWE-Cache/2.0' \
-        "${CWE_API_URL}/version" 2>/dev/null || true)"
-    remote_version="$(printf '%s' "$remote_payload" | jq -r '
-        [.. | strings | select(test("^[0-9]+([.][0-9]+)+$"))][0] //
-        ([.. | objects | (.Version? // .version? // .CweVersion? // .cweVersion?) |
-          select(type=="string")][0] // empty)
-    ' 2>/dev/null || true)"
-
-    if [[ -z "$remote_version" ]]; then
-        printf '[!] CWE API version check unavailable; using local cache version %s.\n' \
-            "${local_version:-unknown}" >&2
-        return 0
-    fi
-    if [[ "$remote_version" == "$local_version" ]]; then
-        printf '[+] CWE cache is current at version %s.\n' "$local_version"
-        return 0
-    fi
-
-    printf '[+] CWE cache update required: local=%s remote=%s.\n' \
-        "${local_version:-missing}" "$remote_version"
-    if ! update_cwe_cache "$remote_version"; then
-        printf '[!] CWE cache update failed; retaining local version %s.\n' \
-            "${local_version:-unknown}" >&2
-    fi
-}
-
-# Return the persistent cache path for one normalized CWE identifier.
-get_cwe_cache_file() {
-    local cwe_id="${1^^}"
-    printf '%s/%s.json\n' "$CWE_CACHE_DIR" "$cwe_id"
-}
-
-# Retrieve one missing MITRE CWE record. Existing valid cache content is reused.
-# API failures are nonfatal so the report retains NVD identifiers and records an
-# explicit degraded source state instead of discarding vulnerability evidence.
-validate_full_cwe_cache() {
-    local cache_file="$1"
-    local cwe_id="${2^^}"
-    local numeric_id="${cwe_id#CWE-}"
-
-    [[ -s "$cache_file" ]] || return 1
-    jq -e --arg id "$cwe_id" --arg numeric "$numeric_id" '
-        [.. | objects | select(
-            (((.ID? // .Id? // .id? // .CWE_ID? // "") | tostring) == $numeric) or
-            (((.ID? // .Id? // .id? // .CWE_ID? // "") | tostring) == $id)
-        ) | select(
-            ((.Name? // .name? // .Title? // .title? // "") | tostring | length) > 0 and
-            ((.Description? // .description? // .Summary? // .summary? // "") |
-                if type == "string" then length > 0 else . != null end)
-        )] | length > 0
-    ' "$cache_file" >/dev/null 2>&1
-}
-
-# Request and retain the complete detailed weakness response unchanged. Old
-# identifier-only cache entries are archived and replaced automatically.
-query_cwe() {
-    local cwe_id="${1^^}"
-    local numeric_id="${cwe_id#CWE-}"
-    local cache_file
-
-    [[ "$cwe_id" =~ ^CWE-[0-9]+$ ]] || return 1
-    [[ -s "$CWE_CATALOG_JSON" ]] || return 1
-    cache_file="${STATE_DIR}/${cwe_id}.source.tmp.json"
-    if jq --arg numeric "$numeric_id" '.entries[$numeric] // empty' \
-        "$CWE_CATALOG_JSON" > "$cache_file" &&
-       validate_full_cwe_cache "$cache_file" "$cwe_id"; then
-        printf '%s\n' "$cache_file"
-        return 0
-    fi
-    rm -f -- "$cache_file"
-    return 1
-}
-
-# Normalize all CWE identifiers present in the NVD dataset. The MITRE response
-# shape is handled defensively because API entries may expose XML-derived field
-# names and nested arrays. Raw cache files remain authoritative evidence.
-build_cwe_dataset() {
-    local nvd_ndjson="$1"
-    ensure_cwe_cache_current || true
-    local cwe_list="${STATE_DIR}/unique-cwes.txt"
-    local cwe_targeted_json="${STATE_DIR}/cwe-targeted.tmp.json"
-    local cwe_fragments="${STATE_DIR}/cwe-targeted.fragments.ndjson"
-    local cwe_id numeric_id cache_file
-
-    CWE_REQUESTED=0
-    CWE_SUCCEEDED=0
-    CWE_FAILED=0
-    : > "$cwe_fragments"
-    printf '[]\n' > "$cwe_targeted_json"
-
-    jq -r '.weaknesses[]? | select(test("^CWE-[0-9]+$"))' "$nvd_ndjson" 2>/dev/null |
-        sort -u > "$cwe_list"
-    CWE_REQUESTED="$(sed '/^$/d' "$cwe_list" | wc -l)"
-
-    while IFS= read -r cwe_id; do
-        [[ -n "$cwe_id" ]] || continue
-        numeric_id="${cwe_id#CWE-}"
-        if ! cache_file="$(query_cwe "$cwe_id")"; then
-            CWE_FAILED=$((CWE_FAILED + 1))
-            printf '[!] CWE entry unavailable in the local full cache: %s.\n' "$cwe_id" >&2
-            continue
-        fi
-        if jq -c --arg id "$cwe_id" --arg numeric "$numeric_id" '
-            def scalar:
-                if .==null then null elif type=="string" then .
-                elif type=="number" or type=="boolean" then tostring
-                elif type=="array" then ([.[]|scalar|select(.!=null and .!="")]|join("; "))
-                else null end;
-            def candidate:
-                [..|objects|select(
-                    (((.ID? // .Id? // .id? // .CWE_ID? // "")|tostring)==$numeric) or
-                    (((.ID? // .Id? // .id? // .CWE_ID? // "")|tostring)==$id)
-                )][0] // (if type=="array" then .[0] else . end);
-            candidate as $w |
-            {
-                id:$id,
-                name:(($w.Name? // $w.name? // $w.Title? // $w.title?)|scalar),
-                abstraction:(($w.Abstraction? // $w.abstraction?)|scalar),
-                status:(($w.Status? // $w.status?)|scalar),
-                description:(($w.Description? // $w.description? // $w.Summary? // $w.summary?)|scalar),
-                extended_description:(($w.Extended_Description? // $w.extendedDescription? // $w.extended_description?)|scalar),
-                likelihood_of_exploit:(($w.Likelihood_Of_Exploit? // $w.likelihoodOfExploit? // $w.likelihood_of_exploit?)|scalar),
-                consequences:([(($w.Common_Consequences? // $w.commonConsequences? // $w.common_consequences? // []) | .. | objects) | {
-                    scope:((.Scope? // .scope?)|scalar),
-                    impact:((.Impact? // .impact?)|scalar),
-                    note:((.Note? // .note?)|scalar)
-                }|select(.scope!=null or .impact!=null or .note!=null)]|unique),
-                mitigations:([(($w.Potential_Mitigations? // $w.potentialMitigations? // $w.potential_mitigations? // []) | .. | objects) | {
-                    phase:((.Phase? // .phase?)|scalar),
-                    strategy:((.Strategy? // .strategy?)|scalar),
-                    description:((.Description? // .description?)|scalar),
-                    effectiveness:((.Effectiveness? // .effectiveness?)|scalar),
-                    effectiveness_notes:((.Effectiveness_Notes? // .effectivenessNotes? // .effectiveness_notes?)|scalar)
-                }|select(.phase!=null or .strategy!=null or .description!=null)]|unique),
-                detection_methods:([(($w.Detection_Methods? // $w.detectionMethods? // $w.detection_methods? // []) | .. | objects) | {
-                    method:((.Method? // .method?)|scalar),
-                    description:((.Description? // .description?)|scalar),
-                    effectiveness:((.Effectiveness? // .effectiveness?)|scalar),
-                    effectiveness_notes:((.Effectiveness_Notes? // .effectivenessNotes? // .effectiveness_notes?)|scalar)
-                }|select(.method!=null or .description!=null)]|unique),
-                reference_url:("https://cwe.mitre.org/data/definitions/"+$numeric+".html"),
-                source:"MITRE CWE",
-                enrichment:{status:"complete",source_record:"persistent_full_cwe_cache"}
-            }' "$cache_file" >> "$cwe_fragments"; then
-            CWE_SUCCEEDED=$((CWE_SUCCEEDED + 1))
-        else
-            CWE_FAILED=$((CWE_FAILED + 1))
-            printf '[!] Failed to normalize cached MITRE data for %s.\n' "$cwe_id" >&2
-        fi
-        rm -f -- "$cache_file"
-    done < "$cwe_list"
-
-    if [[ -s "$cwe_fragments" ]]; then
-        jq -s 'unique_by(.id)' "$cwe_fragments" > "$cwe_targeted_json" ||
-            error_exit "Failed to assemble the temporary targeted CWE object"
-    fi
-    rm -f -- "$cwe_fragments"
-
-    printf '[+] CWE enrichment completed: %d requested, %d available, %d unavailable.\n' \
-        "$CWE_REQUESTED" "$CWE_SUCCEEDED" "$CWE_FAILED"
 }
 
 # Convert cached NVD responses into detailed NDJSON for Phase 2. This retains
@@ -1436,20 +1094,13 @@ build_report_dataset() {
         fi
     done
 
-
-    # Enrich unique NVD weakness identifiers through the persistent MITRE cache.
-    build_cwe_dataset "$nvd_ndjson"
-
     jq -n \
         --argjson nmap_records "$TOTAL_PORTS" \
         --argjson vulners_records "$(wc -l < "${NORMALIZED_DIR}/evidence.ndjson")" \
         --argjson kev_records "${#KEV_SET[@]}" \
         --argjson nvd_requested "$requested_count" \
         --argjson nvd_succeeded "$succeeded_count" \
-        --argjson nvd_failed "$failed_count" \
-        --argjson cwe_requested "$CWE_REQUESTED" \
-        --argjson cwe_succeeded "$CWE_SUCCEEDED" \
-        --argjson cwe_failed "$CWE_FAILED" '
+        --argjson nvd_failed "$failed_count" '
         {
             nmap:{status:"READY",records:$nmap_records,reason:null},
             vulners:{
@@ -1464,13 +1115,6 @@ build_report_dataset() {
                 succeeded:$nvd_succeeded,
                 failed:$nvd_failed,
                 reason:(if $nvd_failed==0 then null else (($nvd_failed|tostring)+" CVE record(s) could not be enriched from NVD.") end)
-            },
-            cwe:{
-                status:(if $cwe_requested==0 then "NOT_REQUESTED" elif $cwe_failed==0 then "READY" elif $cwe_succeeded>0 then "DEGRADED" else "UNAVAILABLE" end),
-                requested:$cwe_requested,
-                succeeded:$cwe_succeeded,
-                failed:$cwe_failed,
-                reason:(if $cwe_failed==0 then null else (($cwe_failed|tostring)+" CWE record(s) could not be enriched from MITRE.") end)
             }
         }' > "$source_status_json" || error_exit "Failed to build enrichment source status"
 
@@ -1494,57 +1138,24 @@ build_finding_record() {
 # independently without changing main() or the established post-scan call chain.
 generate_html_report() {
     local temporary_html="${REPORT_HTML}.tmp.$$"
-    local targeted_cwe_json="${STATE_DIR}/cwe-targeted.tmp.json"
-    local temporary_render_json="${STATE_DIR}/report-with-cwe.tmp.$$.json"
     local line marker_count=0
 
-    cleanup_cwe_render_temporaries() {
-        rm -f -- "$targeted_cwe_json" "$temporary_render_json"
-    }
-
     if [[ ! -r "$HTML_SCHEMA_FILE" ]]; then
-        cleanup_cwe_render_temporaries
         printf '[!] HTML schema template is not installed: %s\n' "$HTML_SCHEMA_FILE" >&2
-        printf '[!] JSON reporting completed. Temporary CWE details were removed.\n' >&2
+        printf '[!] JSON reporting completed. HTML generation will activate when the project template is added.\n' >&2
         return 0
     fi
 
-    [[ -s "$REPORT_JSON" ]] || {
-        cleanup_cwe_render_temporaries
-        error_exit "Cannot generate HTML because report JSON is missing: $REPORT_JSON"
-    }
-
-    [[ -s "$targeted_cwe_json" ]] || printf '[]\n' > "$targeted_cwe_json"
-    jq -e 'type=="array" and all(.[]; (.id|type)=="string")' "$targeted_cwe_json" >/dev/null || {
-        cleanup_cwe_render_temporaries
-        error_exit "Temporary targeted CWE object failed validation"
-    }
-
-    # Enrich only the temporary HTML render payload. The archived report.json
-    # retains identifiers but never stores the targeted CWE detail object.
-    jq --slurpfile cwe "$targeted_cwe_json" '
-        def cwerow($id): ([$cwe[0][] | select(.id==$id)][0] // null);
-        def enrichcve:
-            . + {weakness_details:[(.weaknesses // [])[] as $wid |
-                cwerow($wid) | select(. != null)]};
-        .kev_matched_cves |= map(enrichcve) |
-        .non_kev_cves |= map(enrichcve) |
-        .findings |= map(
-            .cves |= map(enrichcve) |
-            .kev_cves |= map(enrichcve) |
-            .non_kev_cves |= map(enrichcve)
-        )
-    ' "$REPORT_JSON" > "$temporary_render_json" || {
-        cleanup_cwe_render_temporaries
-        error_exit "Failed to join temporary CWE details for HTML rendering"
-    }
+    [[ -s "$REPORT_JSON" ]] || error_exit "Cannot generate HTML because report JSON is missing: $REPORT_JSON"
 
     : > "$temporary_html"
     while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ "$line" == '<!-- REPORT_DATA -->' ]]; then
             marker_count=$((marker_count + 1))
             printf '<script id="report-data" type="application/json">\n' >> "$temporary_html"
-            sed 's#</script#<\\/script#g' "$temporary_render_json" >> "$temporary_html"
+            # Escape a closing script sequence without changing JSON semantics
+            # after JSON.parse reads the textContent value in the browser.
+            sed 's#</script#<\\/script#g' "$REPORT_JSON" >> "$temporary_html"
             printf '\n</script>\n' >> "$temporary_html"
         else
             printf '%s\n' "$line" >> "$temporary_html"
@@ -1553,23 +1164,18 @@ generate_html_report() {
 
     if ((marker_count != 1)); then
         rm -f -- "$temporary_html"
-        cleanup_cwe_render_temporaries
         error_exit "HTML schema must contain exactly one <!-- REPORT_DATA --> marker"
     fi
 
-    [[ -s "$temporary_html" ]] || {
-        cleanup_cwe_render_temporaries
-        error_exit "Generated HTML report is empty"
-    }
+    [[ -s "$temporary_html" ]] || error_exit "Generated HTML report is empty"
     mv -- "$temporary_html" "$REPORT_HTML"
-    cleanup_cwe_render_temporaries
-
-    [[ ! -e "$targeted_cwe_json" && ! -e "$temporary_render_json" ]] ||
-        error_exit "Temporary CWE render objects were not removed"
-    printf '[+] Generated CWE-enriched HTML report: %s\n' "$REPORT_HTML"
-    printf '[+] Temporary targeted CWE JSON object removed after HTML generation.\n'
+    printf '[+] Generated HTML report: %s\n' "$REPORT_HTML"
 }
 
+# Assemble the complete service-centric report. This implementation intentionally
+# omits generator version fields, root schema identifiers, and schema-version
+# validation. Structural and count consistency checks remain because they protect
+# report integrity without publishing or enforcing a generator/schema version.
 export_report_json() {
     local stage_epoch
     local services_ndjson="${NORMALIZED_DIR}/services.ndjson"
@@ -1581,7 +1187,6 @@ export_report_json() {
     local generated_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
     local end_epoch="$(date +%s)"
     local duration_seconds=$((end_epoch - START_EPOCH))
-    
 
     stage_epoch="$(stage_start "Report JSON and HTML generation")"
 
@@ -1614,9 +1219,6 @@ export_report_json() {
         --slurpfile services "$services_ndjson" --slurpfile evidence "$evidence_ndjson" \
         --slurpfile nvd "$nvd_ndjson" --slurpfile kev "$KEV_FILE" \
         --slurpfile source_status "$source_status_json" '
-        def round:
-          floor as $f
-          | if . - $f >= 0.5 then $f + 1 else $f end;
         def severity($s):
             if $coverage_status=="LIMITED" then "Not Assessed"
             elif $s>=9 then "Critical" elif $s>=7 then "High"
@@ -1648,8 +1250,7 @@ export_report_json() {
                 cvss:($n.cvss//$e.cvss_observed),severity:($n.severity//severity($e.cvss_observed)),
                 vector:($n.vector//null),description:($n.description//null),published:($n.published//null),
                 last_modified:($n.last_modified//null),status:($n.status//null),
-                weaknesses:($n.weaknesses//[]),
-                cvss_details:(($n.cvss_details//null) as $d |
+                weaknesses:($n.weaknesses//[]),cvss_details:(($n.cvss_details//null) as $d |
                     if $d==null then null else $d+{observed_source_score:$e.cvss_observed,
                     score_difference:(if $d.base_score==null then null else (($e.cvss_observed-$d.base_score)*10|round/10) end)} end),
                 references_by_type:grouprefs($n.references//[]),
@@ -1729,7 +1330,7 @@ export_report_json() {
             kev_matched_cves:([$allcves[]|select(.kev_match)]|sort_by(-(.cvss//0),.id)),
             non_kev_cves:([$allcves[]|select(.kev_match|not)]|sort_by(-(.cvss//0),.id)),
             findings:$findings,
-            data_quality:{overall_status:(if $coverage_status=="LIMITED" then "PARTIAL" elif $sources.nvd.status=="DEGRADED" or $sources.nvd.status=="UNAVAILABLE" then "PARTIAL" else "READY" end),sources:$sources,nvd_enriched_cves:($nvd|length),source_evidence_records:($ev|length),cwe_enriched_records:($sources.cwe.succeeded//0),warnings:([if $coverage_status=="LIMITED" then $coverage_message else empty end,if $sources.nvd.reason!=null then $sources.nvd.reason else empty end,if $sources.cwe.reason!=null then $sources.cwe.reason else empty end]),caveats:["Nmap Vulners matches are version/CPE correlations and require applicability validation.","Third-party exploit references may duplicate the same underlying vulnerability or proof of concept.","Observed source CVSS values may differ from NVD metrics and are retained as observed evidence.","Derived mitigation and generic controls require operator and vendor review."]}
+            data_quality:{overall_status:(if $coverage_status=="LIMITED" then "PARTIAL" elif $sources.nvd.status=="DEGRADED" or $sources.nvd.status=="UNAVAILABLE" then "PARTIAL" else "READY" end),sources:$sources,nvd_enriched_cves:($nvd|length),source_evidence_records:($ev|length),warnings:([if $coverage_status=="LIMITED" then $coverage_message else empty end,if $sources.nvd.reason!=null then $sources.nvd.reason else empty end]),caveats:["Nmap Vulners matches are version/CPE correlations and require applicability validation.","Third-party exploit references may duplicate the same underlying vulnerability or proof of concept.","Observed source CVSS values may differ from NVD metrics and are retained as observed evidence.","Derived mitigation and generic controls require operator and vendor review."]}
         }' > "$temporary_report" || error_exit "Failed to assemble report JSON"
 
     jq -e '.metadata and .scan_coverage and .statistics and (.findings|type=="array")' "$temporary_report" >/dev/null ||
@@ -1908,10 +1509,6 @@ main() {
     deduplicate_cves
     echo "Matching CVE Results to KEV Database"
     validate_kev_matches
-    echo "Qerying NVD to set API requet limit"
-    configure_nvd_delay
-    echo "NVD API DELAY:${NVD_DELAY}"
-    sleep 10
     echo "Sourcing NVD CVE Information from NIST"
     enrich_nvd_data
     echo "Building Report Database"
