@@ -23,3 +23,4 @@ networkscannerv3.sh
 network_scannerv4.sh
 /.cache/*
 ..bash_history
+.gitignore
