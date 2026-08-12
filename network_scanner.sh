@@ -1312,6 +1312,7 @@ build_cwe_dataset() {
                 if .==null then null elif type=="string" then .
                 elif type=="number" or type=="boolean" then tostring
                 elif type=="array" then ([.[]|scalar|select(.!=null and .!="")]|join("; "))
+                elif type=="object" then ([..|scalars|tostring|select(.!="")]|join("; "))
                 else null end;
             def candidate:
                 [..|objects|select(
@@ -1325,25 +1326,25 @@ build_cwe_dataset() {
                 abstraction:(($w.Abstraction? // $w.abstraction?)|scalar),
                 status:(($w.Status? // $w.status?)|scalar),
                 description:(($w.Description? // $w.description? // $w.Summary? // $w.summary?)|scalar),
-                extended_description:(($w.Extended_Description? // $w.extendedDescription? // $w.extended_description?)|scalar),
-                likelihood_of_exploit:(($w.Likelihood_Of_Exploit? // $w.likelihoodOfExploit? // $w.likelihood_of_exploit?)|scalar),
-                consequences:([(($w.Common_Consequences? // $w.commonConsequences? // $w.common_consequences? // []) | .. | objects) | {
+                extended_description:(($w.ExtendedDescription? // $w.Extended_Description? // $w.extendedDescription? // $w.extended_description?)|scalar),
+                likelihood_of_exploit:(($w.LikelihoodOfExploit? // $w.Likelihood_Of_Exploit? // $w.likelihoodOfExploit? // $w.likelihood_of_exploit?)|scalar),
+                consequences:([(($w.CommonConsequences? // $w.Common_Consequences? // $w.commonConsequences? // $w.common_consequences? // []) | .. | objects) | {
                     scope:((.Scope? // .scope?)|scalar),
                     impact:((.Impact? // .impact?)|scalar),
                     note:((.Note? // .note?)|scalar)
                 }|select(.scope!=null or .impact!=null or .note!=null)]|unique),
-                mitigations:([(($w.Potential_Mitigations? // $w.potentialMitigations? // $w.potential_mitigations? // []) | .. | objects) | {
+                mitigations:([(($w.PotentialMitigations? // $w.Potential_Mitigations? // $w.potentialMitigations? // $w.potential_mitigations? // []) | .. | objects) | {
                     phase:((.Phase? // .phase?)|scalar),
                     strategy:((.Strategy? // .strategy?)|scalar),
                     description:((.Description? // .description?)|scalar),
                     effectiveness:((.Effectiveness? // .effectiveness?)|scalar),
-                    effectiveness_notes:((.Effectiveness_Notes? // .effectivenessNotes? // .effectiveness_notes?)|scalar)
+                    effectiveness_notes:((.EffectivenessNotes? // .Effectiveness_Notes? // .effectivenessNotes? // .effectiveness_notes?)|scalar)
                 }|select(.phase!=null or .strategy!=null or .description!=null)]|unique),
-                detection_methods:([(($w.Detection_Methods? // $w.detectionMethods? // $w.detection_methods? // []) | .. | objects) | {
+                detection_methods:([(($w.DetectionMethods? // $w.Detection_Methods? // $w.detectionMethods? // $w.detection_methods? // []) | .. | objects) | {
                     method:((.Method? // .method?)|scalar),
                     description:((.Description? // .description?)|scalar),
                     effectiveness:((.Effectiveness? // .effectiveness?)|scalar),
-                    effectiveness_notes:((.Effectiveness_Notes? // .effectivenessNotes? // .effectiveness_notes?)|scalar)
+                    effectiveness_notes:((.EffectivenessNotes? // .Effectiveness_Notes? // .effectivenessNotes? // .effectiveness_notes?)|scalar)
                 }|select(.method!=null or .description!=null)]|unique),
                 reference_url:("https://cwe.mitre.org/data/definitions/"+$numeric+".html"),
                 source:"MITRE CWE",
@@ -1414,7 +1415,14 @@ build_report_dataset() {
                     vector:($m.cvssData.vectorString//null),
                     source:($m.source//null),
                     type:($m.type//null),
-                    metrics:{
+                    metrics:(if ($m.cvssData.version//"")=="2.0" then {
+                        access_vector:($m.cvssData.accessVector//null),
+                        access_complexity:($m.cvssData.accessComplexity//null),
+                        authentication:($m.cvssData.authentication//null),
+                        confidentiality_impact:($m.cvssData.confidentialityImpact//null),
+                        integrity_impact:($m.cvssData.integrityImpact//null),
+                        availability_impact:($m.cvssData.availabilityImpact//null)
+                    } else {
                         attack_vector:($m.cvssData.attackVector//null),
                         attack_complexity:($m.cvssData.attackComplexity//null),
                         privileges_required:($m.cvssData.privilegesRequired//null),
@@ -1423,7 +1431,7 @@ build_report_dataset() {
                         confidentiality_impact:($m.cvssData.confidentialityImpact//null),
                         integrity_impact:($m.cvssData.integrityImpact//null),
                         availability_impact:($m.cvssData.availabilityImpact//null)
-                    }
+                    } end)
                 } end),
                 weaknesses:([$c.weaknesses[]?.description[]?|select(.lang=="en")|.value]|unique),
                 references:([$c.references[]?|{url:(.url//""),source:(.source//null),tags:(.tags//[])}]|unique_by(.url)),

@@ -677,30 +677,18 @@
       byId("scope-content").innerHTML = `<div class="table-wrap"><table><caption>Scan capability summary</caption><thead><tr><th>Capability</th><th>Status</th></tr></thead><tbody>${rows.map(r => `<tr><td>${esc(r[0])}</td><td>${esc(r[1])}</td></tr>`).join("")}</tbody></table></div>`;
     }
 
-    function renderCweValue(value) {
-      if (!present(value)) return "";
-      if (Array.isArray(value)) return esc(value.join(", "));
-      if (typeof value !== "object") return esc(value);
-      const paragraphs = Array.isArray(value.p) ? value.p : (present(value.p) ? [value.p] : []);
-      const bullets = Array.isArray(value.ul?.li) ? value.ul.li : (present(value.ul?.li) ? [value.ul.li] : []);
-      const numbered = Array.isArray(value.ol?.li) ? value.ol.li : (present(value.ol?.li) ? [value.ol.li] : []);
-      const parts = paragraphs.map(item => `<p>${esc(item)}</p>`);
-      if (bullets.length) parts.push(`<ul class="list-clean">${bullets.map(item => `<li>${esc(item)}</li>`).join("")}</ul>`);
-      if (numbered.length) parts.push(`<ol class="list-clean">${numbered.map(item => `<li>${esc(item)}</li>`).join("")}</ol>`);
-      return parts.join("") || esc(JSON.stringify(value));
-    }
     function renderCweDetail(weakness) {
       const w=obj(weakness), consequences=arr(w.consequences), mitigations=arr(w.mitigations), detections=arr(w.detection_methods);
-      const row=(label,value)=>present(value)?`<div><strong>${esc(label)}:</strong> ${renderCweValue(value)}</div>`:"";
-      const consequenceRows=consequences.map(c=>`<div class="cwe-record">${row("Scope",c.scope ?? c.Scope)}${row("Impact",c.impact ?? c.Impact)}${row("Note",c.note ?? c.Note)}</div>`).join("");
-      const mitigationRows=mitigations.map((m,index)=>`<div class="cwe-record"><div><strong>Mitigation ${index+1}</strong>${present(m.mitigation_id ?? m.mitigationId ?? m.MitigationID)?` ${badge(m.mitigation_id ?? m.mitigationId ?? m.MitigationID)}`:""}</div>${row("Phase",m.phase ?? m.Phase)}${row("Strategy",m.strategy ?? m.Strategy)}${row("Guidance",m.description ?? m.Description)}${row("Effectiveness",m.effectiveness ?? m.Effectiveness)}${row("Notes",m.effectiveness_notes ?? m.effectivenessNotes ?? m.EffectivenessNotes)}</div>`).join("");
-      const detectionRows=detections.map(d=>`<div class="cwe-record">${row("Method",d.method ?? d.Method)}${row("Description",d.description ?? d.Description)}${row("Effectiveness",d.effectiveness ?? d.Effectiveness)}${row("Notes",d.effectiveness_notes ?? d.effectivenessNotes ?? d.EffectivenessNotes)}</div>`).join("");
+      const row=(label,value)=>present(value)?`<div><strong>${esc(label)}:</strong> ${esc(textValue(value))}</div>`:"";
+      const consequenceRows=consequences.map(c=>`<div class="cwe-record">${row("Scope",c.scope)}${row("Impact",c.impact)}${row("Note",c.note)}</div>`).join("");
+      const mitigationRows=mitigations.map(m=>`<div class="cwe-record">${row("Phase",m.phase)}${row("Strategy",m.strategy)}${row("Guidance",m.description)}${row("Effectiveness",m.effectiveness)}${row("Notes",m.effectiveness_notes)}</div>`).join("");
+      const detectionRows=detections.map(d=>`<div class="cwe-record">${row("Method",d.method)}${row("Description",d.description)}${row("Effectiveness",d.effectiveness)}${row("Notes",d.effectiveness_notes)}</div>`).join("");
       return `<details class="panel cwe-card"><summary>${esc(textValue(w.id))} | ${esc(textValue(w.name,"Detailed name unavailable"))} ${badge(textValue(w.abstraction))} ${badge(textValue(w.status))}</summary><div class="panel-content">
-        <div class="cwe-description">${renderCweValue(w.description ?? "No MITRE CWE description is available.")}</div>
-        ${present(w.extended_description)?`<details class="cwe-group"><summary>Extended description</summary><div class="cwe-record">${renderCweValue(w.extended_description)}</div></details>`:""}
+        <p class="cwe-description">${esc(textValue(w.description,"No MITRE CWE description is available."))}</p>
+        ${present(w.extended_description)?`<details class="cwe-group"><summary>Extended description</summary><div class="cwe-record">${esc(w.extended_description)}</div></details>`:""}
         <dl class="cwe-summary-grid"><div><dt>CWE ID</dt><dd>${esc(textValue(w.id))}</dd></div><div><dt>Abstraction</dt><dd>${esc(textValue(w.abstraction))}</dd></div><div><dt>Status</dt><dd>${esc(textValue(w.status))}</dd></div><div><dt>Exploit likelihood</dt><dd>${esc(textValue(w.likelihood_of_exploit))}</dd></div></dl>
         <div class="cwe-groups"><details class="cwe-group"><summary>Consequences (${consequences.length})</summary>${consequenceRows||`<div class="empty">No consequence details returned.</div>`}</details><details class="cwe-group"><summary>Mitigations (${mitigations.length})</summary>${mitigationRows||`<div class="empty">No mitigation guidance returned.</div>`}</details><details class="cwe-group"><summary>Detection (${detections.length})</summary>${detectionRows||`<div class="empty">No detection details returned.</div>`}</details></div>
-        <div class="cwe-source-row">${present(w.reference_url)?`<a href="${esc(w.reference_url)}" target="_blank" rel="noopener noreferrer">${esc(textValue(w.id))} on MITRE CWE</a>`:""}<div class="callout warning"><strong>Scope:</strong> Vendor and KEV remediation takes precedence.</div></div>
+        <div class="cwe-source-row">${present(w.reference_url)?`<a href="${esc(w.reference_url)}" target="_blank" rel="noopener">${esc(textValue(w.id))} on MITRE CWE</a>`:""}<div class="callout warning"><strong>Scope:</strong> Vendor and KEV remediation takes precedence.</div></div>
       </div></details>`;
     }
 
